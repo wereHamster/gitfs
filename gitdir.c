@@ -12,18 +12,10 @@
 #include <errno.h>
 #include <time.h>
 
-/*
- * TODO - maybe hold onto original allocated space and point all the names
- * into there?
- */
 void gitdir_free(struct gitdir *gdir)
 {
-	unsigned int i;
-
-	for (i = 0; i < gdir->nentries; i++)
-		free(gdir->entries[i].name);
 	free(gdir->entries);
-	free(gdir);
+	free(gdir->backing_file);
 }
 
 #include <stdio.h>
@@ -35,7 +27,6 @@ static int gitdir_parse_one(struct gitdir_entry *r,
 			    const unsigned char *data, size_t *datalenp)
 {
 	const unsigned char *d, *end;
-	const char *name;
 
 	assert(*datalenp > 0);
 	memset(r, 0, sizeof(*r));
@@ -48,7 +39,6 @@ static int gitdir_parse_one(struct gitdir_entry *r,
 	 *   5. 20 byte sha1 value
 	 */
 	d = data;
-fprintf(stderr, "parsing '%s'\n", d);
 	end = d + *datalenp;
 	assert(end > d);
 	r->perm = 0;
@@ -61,16 +51,16 @@ fprintf(stderr, "parsing '%s'\n", d);
 	} while (*d != ' ');
 	if (++d >= end || *d == '\0')
 		return -EIO;
-	name = (const char *) d;
+	r->name = (const char *) d;
 	do {
 		if (++d >= end)
 			return -EIO;
 	} while  (*d != '\0');
 	d++;
-	if (&d[sizeof(r->ptr.sha1)] > end)
+	if (&d[sizeof(r->ptr->sha1)] > end)
 		return -EIO;
-	memcpy(&r->ptr.sha1[0], d, sizeof(r->ptr.sha1));
-	d += sizeof(r->ptr.sha1);
+	r->ptr = (const struct gitobj_ptr *) d;
+	d += sizeof(r->ptr->sha1);
 	assert(d <= end);
 	assert(d > data);
 	assert((d - data) <= (int) *datalenp);
@@ -86,9 +76,6 @@ fprintf(stderr, "parsing '%s'\n", d);
 	/* Not every object (notably directories) carry file permissions */
 	if (r->perm == 0)
 		r->perm = (mode_t) -1;
-	r->name = strdup(name);
-	if (r->name == NULL)
-		return -ENOMEM;
 	*datalenp -= (d - data);
 	return 0;
 }
@@ -110,23 +97,23 @@ static unsigned int to_add(size_t bytes_left)
 	/*
 	 * To mitigate cases where we always underestimate (and to avoid
 	 * the special case where a tiny entry at the end causes us to
-	 * add zero entries) we always
-	 * allocate at least a few
+	 * add zero entries) we always allocate at least a few
 	 */
 	return (result < 6) ? 6 : result;
 }
 
-int gitdir_parse(struct gitdir **resultp,
-		 const unsigned char *data, size_t datalen)
+int gitdir_parse(struct gitdir *gdir, unsigned char *data, size_t datalen)
 {
-	struct gitdir *gdir;
 	struct gitdir_entry *ent;
 	unsigned int nalloced = 0;
+	int out_of_order = -1;
+	const char *last_parsed_name = "";
 	int ret;
 
-	gdir = calloc(1, sizeof(*gdir));
-	if (gdir == NULL)
-		return -ENOMEM;
+	assert(gdir->nentries == 0);
+	assert(gdir->nsubdirs == 0);
+	assert(gdir->entries == NULL);
+	gdir->backing_file = data;
 	data += datalen;
 	while (datalen > 0) {
 		if (gdir->nentries >= nalloced) {
@@ -152,57 +139,84 @@ int gitdir_parse(struct gitdir **resultp,
 		gdir->nentries++;
 		if (ent->type == GFN_DIR)
 			gdir->nsubdirs++;
+		/*
+		 * We do binary searches on the table so the names must be
+		 * sorted.  As far as I can tell git directories always are
+		 * so this is just a redundant check, but for now I want to
+		 * be safe
+		 */
+		if (out_of_order <= 0) {
+			out_of_order = strcmp(last_parsed_name, ent->name);
+			last_parsed_name = ent->name;
+		}
 	}
 	assert(gdir->nsubdirs <= gdir->nentries);
-	/* We do binary searches in this table so the names must be sorted */
-	qsort(gdir->entries, gdir->nentries, sizeof(gdir->entries[0]),
-	      gitdir_entry_compare);
+	if (out_of_order != 0)
+		qsort(gdir->entries, gdir->nentries, sizeof(gdir->entries[0]),
+		      gitdir_entry_compare);
 	(void) time(&gdir->atime);
-	*resultp = gdir;
+	gdir->last_find = 0;
 	return 0;
 }
 
 struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name)
 {
 	struct gitdir_entry *es;
-	int l, r, i, cr;
+	unsigned int i;
+	int l, r, cr;
 
-	/*
-	 * TODO - cache last successful lookup and check for LRU and
-	 * directory scanning
-	 */
 	assert(gdir != NULL);
 	(void) time(&gdir->atime);
 	if (gdir->nentries == 0)
 		return NULL;
-	es = gdir->entries;
-	assert(es != NULL);
+	assert(gdir->entries != NULL);
 	l = 0;
 	r = gdir->nentries - 1;
+	/*
+	 * Two common cases are that we're looking up the same thing as
+	 * last time OR we're scanning the directory linearly and just want
+	 * the next entry
+	 */
+	i = gdir->last_find;
+	assert(i < gdir->nentries);
+	es = &gdir->entries[i];
+	cr = strcmp(name, es->name);
+	if (cr >= 0) {
+		if (cr == 0)
+			return es;
+		if (++i > (unsigned int) r) {
+			assert(i == gdir->nentries);
+			return NULL;
+		}
+		cr = strcmp(name, (++es)->name);
+		if (cr == 0) {
+			gdir->last_find = i;
+			return es;
+		}
+		if (cr < 0)
+			return NULL;
+		l = i + 1;
+	} else {
+		if (i == 0)
+			return NULL;
+		r = i - 1;
+	}
+	/* OK, we'll have to resort to a binary search */
+	es = gdir->entries;
 	do {
 		assert(l >= 0);
 		assert(r < (int) gdir->nentries);
 		i = (l + r) / 2;
 		cr = strcmp(name, es[i].name);
-		/* TEMPORARY DEBUGGING: */
-		if (gitfs_debug != 0)
-			fprintf(stderr, "Seaching for '%s', %d/%d%d, "
-				"got '%s', result=%d\n", name, l, i, r,
-				es[i].name, cr);
-		if (cr == 0)
+		if (cr == 0) {
+			gdir->last_find = i;
 			return &es[i];
+		}
 		if (cr < 0)	/* name < current element */
 			r = i - 1;
 		else		/* name > current element */
 			l = i + 1;
 	} while (r >= l);
-	/* TEMPORARY DEBUGGING: */
-	if (gitfs_debug != 0) {
-		fprintf(stderr, "NOT FOUND\n");
-		for (i = 0; i < (int) gdir->nentries; i++)
-			if (0==strcmp(es[i].name, name))
-				fprintf(stderr, "WAS AT %d!!!!\n", i);
-	}
 	return NULL;
 }
 

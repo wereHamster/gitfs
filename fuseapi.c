@@ -79,11 +79,13 @@ static int gitfs_getattr(const char *path, struct stat *sbuf)
 	}
 	switch (gn->type) {
 	case GFN_FILE:
-		if (sbuf->st_mode == (mode_t) -1)
+		if (gn->op.f->is_sticky != NULL && gn->op.f->is_sticky(gn)) {
+			if (sbuf->st_mode == (mode_t) -1)
+				sbuf->st_mode = 0644;
+			sbuf->st_mode |= S_ISVTX;
+		} else if (sbuf->st_mode == (mode_t) -1)
 			sbuf->st_mode = 0444;
 		sbuf->st_mode |= S_IFREG;
-		if (gn->op.f->is_sticky != NULL && gn->op.f->is_sticky(gn))
-			sbuf->st_mode |= S_ISVTX;
 		break;
 	case GFN_DIR:
 		if (sbuf->st_mode == (mode_t) -1)
@@ -218,12 +220,19 @@ static int gitfs_read(const char *path, char *buf, size_t size, off_t offset,
 
 int api_umount(const char *path)
 {
-	(void) execlp("fusermount", "fusermount", "-u", path, NULL);
-	fprintf(stderr, "fatal: cannot find fusemount binary in PATH!\n");
+	static const char umount_prog[] = "fusermount";
+
+	(void) execlp(umount_prog, umount_prog, "-u", "-z", "-q",
+		      path, NULL);
+	fprintf(stderr, "fatal: cannot find fusemount binary in $PATH!\n");
 	return 8;
 }
 
-int api_mount(const char *path)
+static struct fuse *fuseh;
+static int fuse_fd;
+static const char *fuse_mountpoint;
+
+int api_prepare_mount(const char *path)
 {
 	static const struct fuse_operations oper = {
 		.getattr = gitfs_getattr,
@@ -246,15 +255,41 @@ int api_mount(const char *path)
 		.chmod = gitfs_chmod,
 #endif
 	};
-	char *args[10];
-	int nargs = 0;
 
+	fuse_mountpoint = path;
 	my_uid = getuid();
 	my_gid = getgid();
-	args[nargs++] = "gitfs";
-	if (gitfs_debug != 0)
-		args[nargs++] = "-d";
-	args[nargs++] = (char *) path;
-	args[nargs] = NULL;
-	return fuse_main(nargs, args, &oper);
+
+	fuse_fd = fuse_mount(path, "fsname=gitfs");
+	if (fuse_fd < 0)
+		return 4;
+	fuseh = fuse_new(fuse_fd, (gitfs_debug != 0) ? "debug" : NULL,
+			 &oper, sizeof(oper));
+	if (fuseh == NULL) {
+		fuse_unmount(path);
+		return 4;
+	}
+	return 0;
+}
+
+void api_abandon_mount(void)
+{
+	fuse_destroy(fuseh);
+	(void) close(fuse_fd);
+	fuse_unmount(fuse_mountpoint);
+}
+
+int api_run_mount(void)
+{
+	for (;;) {
+		struct fuse_cmd *cmd;
+		if (gitfs_please_exit != 0)
+			break;
+		cmd = fuse_read_cmd(fuseh);
+		if (cmd == NULL)
+			continue;
+		fuse_process_cmd(fuseh, cmd);
+	}
+	api_abandon_mount();
+	return 0;
 }

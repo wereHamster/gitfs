@@ -68,8 +68,7 @@ static void gobj_destroy(struct gitobj *gobj)
 {
 	switch (gobj->type) {
 	case GFN_DIR:
-		assert(gobj->d.dir.contents != NULL);
-		gitdir_free(gobj->d.dir.contents);
+		gitdir_free(&gobj->d.dir);
 		break;
 	case GFN_FILE:
 	case GFN_SYMLINK:
@@ -124,6 +123,15 @@ static int raw_resolve_reference(const unsigned char *obuf,
 		raw_resolve_reference(obuf, nbufp, sizep,		\
 			rtype " ", strlen_const(rtype " "), type)
 
+/*
+ * TODO -- it would help A LOT if we had a version of this that got the
+ * type and size without actually decoding the file (from the pack header
+ * or via zlib magic) but unfortunately the publicly-exposed GIT API doesn't
+ * provide us a simple way of doing that.
+ *
+ * For the common case where we're called from gitobj_from_ptr() there's
+ * no need to actually decode the compressed data yet
+ */
 static int git_read(const struct gitobj_ptr *ptr,
 		    unsigned char **bufp, unsigned long *sizep,
 		    enum gitfs_node_type *typep)
@@ -158,7 +166,7 @@ static int git_read(const struct gitobj_ptr *ptr,
 		*typep = GFN_DIR;
 	} else if (0 == strcmp(type, "blob")) {
 		*typep = GFN_FILE;
-		/* Note, this could actually turn out to be a symlink */
+		/* Note: this could actually turn out to be a symlink */
 	} else {
 		free(buf);		/* Unknown type */
 		return -EIO;
@@ -192,14 +200,14 @@ static int gobj_open_file(struct gitobj *gobj)
 	if (errno != ENOENT)
 		return neg_errno();
 	/* OK, it doesn't exist in cache yet; create it */
-	wfd = open(fname, O_WRONLY | O_CREAT, 0444);
+	wfd = open(fname, O_WRONLY | O_CREAT | O_EXCL, 0444);
 	if (wfd < 0 && errno == ENOENT) {
 		ret = recursive_mkdir(fname, 1);
 		if (ret != 0) {
 			assert(ret < 0);
 			return ret;
 		}
-		wfd = open(fname, O_WRONLY | O_CREAT, 0444);
+		wfd = open(fname, O_WRONLY | O_CREAT | O_EXCL, 0444);
 	}
 	if (wfd < 0)
 		return neg_errno();
@@ -232,7 +240,7 @@ static int gobj_open_file(struct gitobj *gobj)
 static int gitfile_stat(struct gitobj *gobj, struct stat *sbuf)
 {
 	char fname[PATH_MAX];
-	int ret, fd;
+	int ret;
 
 	assert(gobj->type == GFN_FILE || gobj->type == GFN_SYMLINK);
 	/* First, if we already have the file open, just use fstat */
@@ -253,18 +261,12 @@ static int gitfile_stat(struct gitobj *gobj, struct stat *sbuf)
 	if (errno != ENOENT)
 		return neg_errno();
 	/*
-	 * OK, just to get the basic data we need to populate it into the
-	 * cache.  Painful but neccesary I think.
-	 * TODO -- possibly optimize this by just opening the gitobj into
-	 * RAM?  We only want the size after all
+	 * If we don't have it in ocache just grab the size and use the
+	 * atime that we already got from the backing git file
 	 */
-	fd = gobj_open_file(gobj);
-	if (fd < 0)
-		return fd;
-	ret = (fstat(fd, sbuf) != 0) ? neg_errno() : 0;
-	gobj_close_file(gobj);
-	sbuf->st_atime = 0;	/* We haven't accessed the cache yet */
-	return ret;
+	sbuf->st_atime = 0;
+	sbuf->st_size = gobj->d.file.size;
+	return 0;
 }
 
 static int gitobj_stat(struct gitfs_node *gn, struct stat *sbuf)
@@ -282,8 +284,21 @@ static int gitobj_stat(struct gitfs_node *gn, struct stat *sbuf)
 		assert(ret < 0);
 		return ret;
 	}
-	if (stat(fname, &bst) != 0)
-		return neg_errno();
+	if (stat(fname, &bst) != 0) {
+		struct packed_git *pg;
+		if (errno != ENOENT)
+			return neg_errno();
+		/*
+		 * If the backing sha1 file wasn't found it's likely that
+		 * it's part of a git pack; just use the times on the pack
+		 * file in that case
+		 */
+		pg = find_sha1_pack(&gn->gitobj->hash.sha1[0], packed_git);
+		if (pg == NULL)
+			return -ENOENT;
+		if (stat(pg->pack_name, &bst) != 0)
+		  	return neg_errno();
+	}
 	sbuf->st_ctime = bst.st_ctime;
 	sbuf->st_atime = bst.st_atime;
 	sbuf->st_mtime = bst.st_mtime;
@@ -301,10 +316,8 @@ static int gitobj_stat(struct gitfs_node *gn, struct stat *sbuf)
 		break;
 	case GFN_DIR:
 		{
-			struct gitdir *gd;
+			const struct gitdir *gd = &gn->gitobj->d.dir;
 			assert(gn->gitobj->type == GFN_DIR);
-			gd = gn->gitobj->d.dir.contents;
-			assert(gd != NULL);
 			sbuf->st_atime = gd->atime;
 			/* Old school UNIX: */
 			sbuf->st_size = 16 * gd->nentries;
@@ -366,11 +379,10 @@ static int gitobj_lookup(struct gitfs_node *parent,
 
 	assert (parent->type == GFN_DIR);
 	assert (parent->gitobj->type == GFN_DIR);
-	assert (parent->gitobj->d.dir.contents != NULL);
-	e = gitdir_find(parent->gitobj->d.dir.contents, name);
+	e = gitdir_find(&parent->gitobj->d.dir, name);
 	if (e == NULL)
 		return -ENOENT;
-	return gitobj_lookup_byptr(&e->ptr, resultp, e);
+	return gitobj_lookup_byptr(e->ptr, resultp, e);
 }
 
 static int gitobj_readdir(struct gitfs_node *gn,
@@ -378,8 +390,7 @@ static int gitobj_readdir(struct gitfs_node *gn,
 {
 	assert (gn->type == GFN_DIR);
 	assert (gn->gitobj->type == GFN_DIR);
-	assert (gn->gitobj->d.dir.contents != NULL);
-	gitdir_readdir(gn->gitobj->d.dir.contents, ars);
+	gitdir_readdir(&gn->gitobj->d.dir, ars);
 	return 0;
 }
 
@@ -387,8 +398,7 @@ static unsigned int gitobj_count_subdirs(struct gitfs_node *gn)
 {
 	assert (gn->type == GFN_DIR);
 	assert (gn->gitobj->type == GFN_DIR);
-	assert (gn->gitobj->d.dir.contents != NULL);
-	return gn->gitobj->d.dir.contents->nsubdirs;
+	return gn->gitobj->d.dir.nsubdirs;
 }
 
 static int gitobj_readlink(struct gitfs_node *gn, char *result, size_t *rlen)
@@ -490,25 +500,31 @@ static int gitobj_from_ptr(struct gitobj **gop, const struct gitobj_ptr *ptr)
 	}
 	switch (gobj->type) {
 	case GFN_DIR:
-		ret = gitdir_parse(&gobj->d.dir.contents, buf, size);
+		ret = gitdir_parse(&gobj->d.dir, buf, size);
 		if (ret != 0) {
 			assert(ret < 0);
+			free(buf);
 			free(gobj);
 			return ret;
 		}
-		assert(gobj->d.dir.contents != NULL);
 		// TODO - we really should grab the atime() from the
 		// backing file before we read it or something... not
 		// a big deal, though
-		(void) time(&gobj->d.dir.contents->atime);
+		(void) time(&gobj->d.dir.atime);
+		/*
+		 * NOTE: we don't free(buf) here since the directory takes
+		 * ownership of it as ->d.dir.backing_file; it's free'd
+		 * when the object is destroyed
+		 */
 		break;
 	case GFN_FILE:
 		gobj->d.file.backing_fd = -1;
+		gobj->d.file.size = size;
+		free(buf);
 		break;
 	default:
 		assert(0);
 	}
-	free(buf);
 	*gop = gobj;
 	return 0;
 }

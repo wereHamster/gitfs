@@ -1,6 +1,6 @@
 # Set to where your git source tree is, and what flags are required to build
 # against it
-GITDIR = ../git/git-20050526
+GITDIR = ../git/git-core-0.99.8
 GITCFLAGS = '-DSHA1_HEADER=<openssl/sha.h>' -I$(GITDIR)
 GITLDFLAGS = $(GITDIR)/libgit.a -lcrypto
 

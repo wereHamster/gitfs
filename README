@@ -1,4 +1,4 @@
-GITFS pre-release version 0.01
+GITFS pre-release version 0.02
 
 gitfs is a FUSE-based filesystem for working with source trees stored in
 git repositories.  Currently only very basic functionality is implemented
@@ -41,10 +41,10 @@ However, two things changed recently:
      this is especially handy.  Leveraging the existing git code and
      design has sped this up immeasurably.
 
-  2. FUSE (filesystem in userspace) has become more widely available --
-     it hasn't make it to mainline yet but it is in the -mm series kernels.
-     This made getting started on actual implementation a lot easier.
-     Writing a userspace filesystem on top of FUSE is really a joy.
+  2. FUSE (filesystem in userspace) has become much more widely deployed --
+     it's even in the current mainline kernels!  Prototyping a userspace
+     filesystem on top of FUSE is really a joy, even if it's a perfect
+     fit for what I'm trying to do.
 
 I'm currently calling this project "gitfs" although perhaps that is a
 bit of a misnomer since I am _absolutely_not_ trying to implement the
@@ -62,7 +62,7 @@ CURRENT STATE
 This is an early pre-release that only demonstrates the most basic of
 functionality -- read-only access to the existing tags and objects in
 the git repository.  Still, it's already a somewhat handy tool which is
-why I'm announcing it now.
+why I'm releasing this early snapshot.
 
 In addition to the missing functionality, currently there is a lot of
 performance work to do -- I've been working on getting it functionally
@@ -82,7 +82,7 @@ correct first.  Specific performance work I'm planing includes:
   3. Since we cache the uncompressed file data our read/write operations
      always go straight through to the underlying files.  A large performance
      boost would be available if at open()-time we could tell the kernel
-     "here's the file descriptor I opened for you, do I/O to that"  That
+     "here's a file descriptor I opened for you, do I/O to that"  That
      way we could avoid the need for all data to make two user/kernel
      transitions.  However, this would require some extensive work to
      FUSE to implement.
@@ -119,8 +119,10 @@ RUNNING GITFS
 
   Options:
 
-    -d -- debugging mode; we run in the foreground and print very verbose
-          messages about what is going on (mostly courtesy of FUSE)
+    -f -- run in foreground; filesystem is automatically closed on clean exit
+
+    -d -- debugging mode; very verbose messages about what is going on
+	  (mostly courtesy of the FUSE library)  Implies -f
 
     -O -- specify an object cache directory.  For fast performance we always
 	  store the result of decompressing a git "blob" object in a file.
@@ -135,7 +137,8 @@ RUNNING GITFS
 	  (or even blow away the entire tree) while gitfs is running.
 
 Under normal operation gitfs would run in the background until you unmount
-it with "gitfs -u"  *However*, we currently always run in "debug" mode so the
+it with "gitfs -u"  If you're running in debug mode we'll autom
+*However*, we currently always run in "debug" mode so the
 gitfs program runs in the foreground.  To shut down you just have to send
 it a ctrl-C and it should shut down cleanly.  For now you should only have
 to use "gitfs -u" if something goes wrong and it crashes.

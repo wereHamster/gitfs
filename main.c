@@ -6,9 +6,12 @@
  *  See the file COPYING.
  */
 
+#define _GNU_SOURCE		/* for sigset() */
 #include "gitfs.h"
 #include "defaults.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
 #include <unistd.h>
 #include "cache.h"		/* from git core */
 
@@ -40,11 +43,12 @@ static void print_usage(const char *argv0)
 	argv0 += basename_offset(argv0);
 	fprintf(stderr,
 	  "%s: usage:\n"
-	  "\t"	"%s [-d] [-O <ocache_dir>] <gitdir> <mntpoint>\n"
-	  "\t"  "%s [-u] [-d] <mntpoint>\n"
+	  "\t"	"%s [-f] [-d] [-O <ocache_dir>] <gitdir> <mntpoint>\n"
+	  "\t"  "%s -u [-d] <mntpoint>\n"
 	  "\n"
 	  "Options:\n"
-	  "\t"	"-d : turn on debugging mode (runs in foreground)\n"
+	  "\t"	"-f : run in foreground, unmount on clean exit\n"
+	  "\t"	"-d : turn on debugging mode (implies -f)\n"
 	  "\t"	"-O : specify object cache directory\n"
 	  "\t"	"-u : unmount gitfs filesystem\n",
 		argv0, argv0, argv0);
@@ -67,26 +71,49 @@ static int chdir_to_git(const char *path)
 	return 0;
 }
 
-// TODO -- currently I can't turn gitfs_debug OFF.  fuse_main() calls
-//   the libc daemon() function when not in debugging mode which does
-//   a chdir("/"), wiping out the effect of the chdir_to_git()  I'll
-//   look into working around this later
-int gitfs_debug = 1;
+int gitfs_debug = 0;
 const char *ocache_dir = DEFAULT_OBJECT_CACHE_DIR;
+int gitfs_please_exit = 0;
+
+static void got_signal(int sig)
+{
+	(void) sig;
+	gitfs_please_exit = 1;
+}
+
+static int set_signals(void)
+{
+	static const struct {
+		int sig;
+		void (*handler)(int);
+	} hands[] = {
+		{ SIGHUP, got_signal },
+		{ SIGINT, got_signal },
+		{ SIGTERM, got_signal },
+		{ SIGPIPE, SIG_IGN },
+	};
+	unsigned int i;
+
+	for (i = 0; i < (sizeof(hands) / sizeof(hands[0])); i++)
+		if (sigset(hands[i].sig, hands[i].handler) == SIG_ERR)
+			return -1;
+	return 0;
+}
 
 int main(int argn, char * const *argv)
 {
 	const char *argv0;
-	int c;
+	int n;
 	int do_umount = 0;
 	int got_mount_arg = 0;
+	int run_in_foreground = 0;
 
 	argv0 = argv[0];
-	for (;;) {
-		c = getopt(argn, argv, "duO:");
-		if (c == EOF)
+	while (n = getopt(argn, argv, "fduO:"), n != EOF)
+		switch (n) {
+		case 'f':
+			run_in_foreground = 1;
 			break;
-		switch (c) {
 		case 'd':
 			gitfs_debug = 1;
 			break;
@@ -101,7 +128,6 @@ int main(int argn, char * const *argv)
 			print_usage(argv0);
 			return 8;
 		}
-	}
 	argv += optind;
 
 	if (do_umount != 0) {
@@ -116,11 +142,22 @@ int main(int argn, char * const *argv)
 		print_usage(argv0);
 		return 8;
 	}
-	if (chdir_to_git(argv[0]) != 0) {
-		perror("chdir to git root");
+	if (chdir_to_git(argv[0]) != 0)
 		return 8;
-	}
 	if (prepare_git_environment() != 0)
 		return 8;
-	return api_mount(argv[1]);
+	n = api_prepare_mount(argv[1]);
+	if (n != 0)
+		return n;
+	if (gitfs_debug == 0 && run_in_foreground == 0 && daemon(1, 0) != 0) {
+		perror("daemonize");
+		api_abandon_mount();
+		return 8;
+	}
+	if (set_signals() != 0) {
+		perror("sigset");
+		api_abandon_mount();
+		return 8;
+	}
+	return api_run_mount();
 }

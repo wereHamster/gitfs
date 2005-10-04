@@ -39,8 +39,8 @@ extern struct gitobj_ptr dummy_ptr; /* doesn't exist; only for sizeof() */
 #define HEX_PTR_LEN	(strlen_const("AA") * sizeof(dummy_ptr.sha1))
 
 struct gitdir_entry {
-	struct gitobj_ptr ptr;
-	char *name;
+	const char *name;
+	const struct gitobj_ptr *ptr;
 	enum gitfs_node_type type;
 	mode_t perm;
 };
@@ -48,12 +48,14 @@ struct gitdir_entry {
 struct gitdir {
 	/* entries are stored in order so we can binary search them */
 	struct gitdir_entry *entries;
+	char *backing_file;
 	unsigned int nentries;
 	unsigned int nsubdirs;
 	time_t atime;
+	unsigned int last_find;
 };
 
-extern int gitdir_parse(struct gitdir **resultp, const unsigned char *data,
+extern int gitdir_parse(struct gitdir *gdir, unsigned char *data,
 			size_t datalen);
 extern void gitdir_free(struct gitdir *gdir);
 extern struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name);
@@ -67,11 +69,10 @@ struct gitobj {
 	struct gitobj_ptr hash;
 	enum gitfs_node_type type;
 	union {
-		struct {
-			struct gitdir *contents;
-		} dir;
+		struct gitdir dir;
 		struct {		/* also used for symlinks */
 			int backing_fd;
+			off_t size;
 		} file;
 	} d;
 	mode_t perm;
@@ -228,7 +229,9 @@ extern int worktree_lookup(struct gitfs_node **resultp, const char *name);
 
 extern int api_add_dir_contents(struct api_readdir_state *ars,
 				const char *name, enum gitfs_node_type type);
-extern int api_mount(const char *path);
+extern int api_prepare_mount(const char *path);
+extern void api_abandon_mount(void);
+extern int api_run_mount(void);
 extern int api_umount(const char *path);
 
 /**************
@@ -236,6 +239,7 @@ extern int api_umount(const char *path);
  **************/
 
 extern int gitfs_debug;
+extern int gitfs_please_exit;
 extern const char *ocache_dir;
 
 #endif /* !GOT_GITFS_H */

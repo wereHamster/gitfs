@@ -10,26 +10,20 @@ Prerequisites:
     work or not.
 
     You also need to be running a kernel with FUSE filesystem support compiled
-    in.  Probably the easiest way to do this is just run a recent -mm
-    kernel -- I'm using 2.6.12-rc5-mm2 on my test machine currently.  The
-    fuse package also provides a method for patching a non -mm kernel, but
-    I haven't tried that.
+    in -- very recent mainline kernels now support this (CONFIG_FUSE_FS)
 
-  * GIT
+  * GIT  --  http://www.kernel.org/pub/software/scm/git/
 
-    Personally, I'm still using the git-20050526 snapshot that Jeff Garzik
-    made last month.  Hopefully it will work against a more recent git
-    still, but maybe some tweaking will be needed.  Updating to a more
-    current git tree is high on my TODO list.
-
-    Since we link against libgit.a you'll need to have the compiled source
-    tree sitting around to build gitfs.
+    Currently tested with git-core-0.99.8.  Since we link against libgit.a
+    you'll need to have the compiled source tree sitting around to build gitfs.
 
 Next, edit the first few lines of Makefile to suit:
 
- GITCFLAGS, GITLDFLAGS -- flags required to compile and link against git
+ GITDIR, GITCFLAGS, GITLDFLAGS -- flags required to compile and link against
+    git.  Probably you'll just need to point GITDIR at the directory your
+    git tools were built at (including libgit.a and cache.h)
 
-  FUSECFLAGS, FUSELDFLAGS -- flags required to compile and link against fuse.
+ FUSECFLAGS, FUSELDFLAGS -- flags required to compile and link against fuse.
     Hopefully if you did a "make install" the fuse files should be installed
     into /usr/local already and you won't need to change these
 
