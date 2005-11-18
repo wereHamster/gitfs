@@ -6,6 +6,7 @@
  *  See the file COPYING.
  */
 
+#define _GNU_SOURCE	/* for clock_gettime() */
 #include "gitfs.h"
 #include <stdio.h>
 #include <errno.h>
@@ -14,9 +15,14 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <sys/mman.h>
-#include "cache.h"	/* from git core */
+#include <sys/stat.h>
+#include "cache.h"	/* for get_sha1_hex() */
 
-int neg_errno(void)
+int
+#ifdef __GNUC__
+    __attribute__ ((warn_unused_result))
+#endif /* __GNUC__ */
+neg_errno(void)
 {
 	if (errno > 0)
 		return -errno;
@@ -28,6 +34,16 @@ int neg_errno(void)
 	 * to be returned by a normal filesystem call
 	 */
 	return -EADDRNOTAVAIL;
+}
+
+void timespec(struct timespec *now)
+{
+	int rv = clock_gettime(CLOCK_REALTIME, now);
+
+	if (unlikely(rv != 0)) {
+		perror("clock_gettime");
+		abort();
+	}
 }
 
 /* Write "dir/fn" into buf, with robust size checking */
@@ -55,15 +71,6 @@ int create_fullpath(char *buf, size_t bufsiz, const char *dir, const char *fn)
 		return -ENAMETOOLONG;
 	memcpy(buf, fn, x);
 	return 0;
-}
-
-
-/* returns modification time of inode or 0 on error */
-time_t mtime_of(const char *path)
-{
-	struct stat st;
-
-	return (stat(path, &st) == 0) ? st.st_mtime : 0;
 }
 
 size_t basename_offset(const char *path)
@@ -97,25 +104,28 @@ int read_ptr(int fd, struct gitobj_ptr *ptr)
 	int count;
 	const char *p;
 
+    read_again:
 	count = read(fd, buf, sizeof(buf));
 	if (count < 0) {
-		// TODO - print error
+		if (errno == EINTR)
+			goto read_again;
+		gdbg("error reading git ptr from file: %s", strerror(errno));
 		return count;
 	}
 	if ((unsigned int) count >= sizeof(buf)) {
 		assert(count == sizeof(buf));
-		// TODO - print error
+		gdbg("git ptr in file was too long");
 		return -ENAMETOOLONG;
 	}
 	buf[count] = '\0';
 	p = buf;
 	if (get_sha1_hex(p, &ptr->sha1[0]) != 0) {
-		// TODO - print error
+		gdbg("git ptr in file was invalid SHA1");
 		return -EINVAL;
 	}
 	for (p += HEX_PTR_LEN; *p != '\0'; p++)
 		if (*p != '\r' && *p != '\n') {
-			// TODO - print error
+			gdbg("git ptr in file had extra characters after");
 			return -EINVAL;
 		}
 	return 0;
@@ -161,7 +171,7 @@ int recursive_mkdir(const char *path, int strip_basename)
 	return 0;
 }
 
-int write_safe(int wfd, void *data, size_t datalen)
+int write_safe(int wfd, const void *data, size_t datalen)
 {
 	size_t off = 0;
 	ssize_t progress;
@@ -169,9 +179,36 @@ int write_safe(int wfd, void *data, size_t datalen)
 	while (off < datalen) {
 		progress = write(wfd, data + off, datalen - off);
 		if (progress <= 0) {
-			if (progress < 0 && errno == EAGAIN)
-				continue;
-			return (progress < 0) ? neg_errno() : -ENOSPC;
+			int rv;
+			if (progress < 0) {
+				rv = neg_errno();
+				if (rv == -EINTR || errno == -EAGAIN)
+					continue;
+			} else
+				rv = -ENOSPC;
+			return rv;
+		}
+		off += progress;
+	}
+	return 0;
+}
+
+int read_safe(int rfd, void *data, size_t datalen)
+{
+	size_t off = 0;
+	ssize_t progress;
+
+	while (off < datalen) {
+		progress = read(rfd, data + off, datalen - off);
+		if (progress <= 0) {
+			int rv;
+			if (progress < 0) {
+				rv = neg_errno();
+				if (rv == -EINTR || errno == -EAGAIN)
+					continue;
+			} else
+				rv = -ENOMSG;
+			return rv;
 		}
 		off += progress;
 	}
@@ -228,4 +265,88 @@ int move_file(const char *src, const char *dst)
 	ret = neg_errno();
 	(void) unlink(dst);
 	return ret;
+}
+
+int set_nonblock(int fd)
+{
+	int flags = fcntl(fd, F_GETFL);
+
+	if (flags < 0) {
+		perror("fcntl(F_GETFL)");
+		return -1;
+	}
+	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		perror("fcntl(F_SETFL)");
+		return -1;
+	}
+	return 0;
+}
+
+void gitptr_ascii(struct gitobj_ptr_ascii *o, const struct gitobj_ptr *gp)
+{
+	const unsigned char *b = &gp->sha1[0];
+	char *r = &o->ascii[0];
+	unsigned int i = 0;
+
+	do {
+		*r++ = xdigit_lc[(*b >> 4) & 0xF];
+		*r++ = xdigit_lc[(*b >> 0) & 0xF];
+		b++;
+	} while (++i < sizeof(gp->sha1));
+	*r = '\0';
+}
+
+int gitptr_to_fname(char *buf, size_t bufsiz, const char *dir,
+		    const struct gitobj_ptr *gp)
+{
+	const unsigned char *b;
+	unsigned int i;
+
+	if (dir != NULL && *dir != '\0') {
+		size_t dlen = strlen(dir);
+		if (bufsiz <= dlen)
+			return -ENAMETOOLONG;
+		memcpy(buf, dir, dlen);
+		buf += dlen;
+		bufsiz -= dlen;
+		if (buf[-1] != '/') {
+			if (bufsiz < 1)
+				return -ENAMETOOLONG;
+			*buf++ = '/';
+			bufsiz--;
+		}
+	}
+	if (bufsiz < 2 + HEX_PTR_LEN)
+		return -ENAMETOOLONG;
+	b = &gp->sha1[0];
+	for (i = 0; i < sizeof(gp->sha1); i++) {
+		*buf++ = xdigit_lc[(*b >> 4) & 0xF];
+		*buf++ = xdigit_lc[(*b >> 0) & 0xF];
+		b++;
+		if (i == 0)
+			*buf++ = '/';
+	}
+	*buf = '\0';
+	return 0;
+}
+
+/*
+ * Convert a string into an unsigned integer.  This is a very strict
+ * implementation: no leading zeros, overflow is prevented
+ */
+int convert_uint64(const char *str, uint64_t *res)
+{
+	if (str[0] == '\0')
+		return -1;
+	if (str[0] == '0' && str[1] != '\0')
+		return -1;
+	*res = 0;
+	do {
+		if (*str < '0' || *str > '9')
+			return -1;
+		if (*res > ((~(uint64_t) 0) - 9) / 10)
+			return -1;	/* overflow risk */
+		*res = ((*res) * 10) + (*str - '0');
+	} while (*++str != '\0');
+	return 0;
 }

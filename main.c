@@ -6,158 +6,207 @@
  *  See the file COPYING.
  */
 
-#define _GNU_SOURCE		/* for sigset() */
 #include "gitfs.h"
-#include "defaults.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
-#include <unistd.h>
-#include "cache.h"		/* from git core */
-
-/* Set up git to read from the current directory */
-static int prepare_git_environment(void)
-{
-	static const struct {
-		const char *s;
-	} to_unset[] = {
-		{ ALTERNATE_DB_ENVIRONMENT },
-		{ "SHA1_FILE_DIRECTORIES" },
-		{ DB_ENVIRONMENT },
-		{ "SHA1_FILE_DIRECTORY" },
-		{ INDEX_ENVIRONMENT },
-	};
-	unsigned int i;
-
-	for (i = 0; i < sizeof(to_unset) / sizeof(to_unset[0]); i++)
-		unsetenv(to_unset[i].s);
-	if (setenv(GIT_DIR_ENVIRONMENT, ".", 1) != 0) {
-		perror("setenv");
-		return -1;
-	}
-	return 0;
-}
-
-static void print_usage(const char *argv0)
-{
-	argv0 += basename_offset(argv0);
-	fprintf(stderr,
-	  "%s: usage:\n"
-	  "\t"	"%s [-f] [-d] [-O <ocache_dir>] <gitdir> <mntpoint>\n"
-	  "\t"  "%s -u [-d] <mntpoint>\n"
-	  "\n"
-	  "Options:\n"
-	  "\t"	"-f : run in foreground, unmount on clean exit\n"
-	  "\t"	"-d : turn on debugging mode (implies -f)\n"
-	  "\t"	"-O : specify object cache directory\n"
-	  "\t"	"-u : unmount gitfs filesystem\n",
-		argv0, argv0, argv0);
-}
-
-static int chdir_to_git(const char *path)
-{
-	struct stat dummy_st;
-
-	if (chdir(path) != 0) {
-		perror("chdir to git dir");
-		return -1;
-	}
-	/*
-	 * For convinience, if it looks like the user didn't specify the
-	 * final "/.git" part of the path, assume it was there
-	 */
-	if (stat(".git/objects/.", &dummy_st) == 0)
-		(void) chdir(".git");
-	return 0;
-}
+#include <string.h>
 
 int gitfs_debug = 0;
-const char *ocache_dir = DEFAULT_OBJECT_CACHE_DIR;
-int gitfs_please_exit = 0;
 
-static void got_signal(int sig)
+static const char *argv0;
+static const struct gitfs_subcommand *gitfs_subcommands[];
+static const struct gitfs_subcommand *subcommand = NULL;
+
+static void print_subcommand_usage(FILE *fp, const char *prefix,
+				   const struct gitfs_subcommand *sc)
 {
-	(void) sig;
-	gitfs_please_exit = 1;
+	const char *s;
+	int start_of_line = 1;
+
+	s = sc->usage;
+	assert(s != NULL);
+	for (;;) {
+		const char *e;
+		char c;
+		e = s;
+		do {
+			c = *e;
+			if (c == '&')
+				break;
+			if (c == '\0') {
+				if (e == s)
+					return;
+				break;
+			}
+			e++;
+		} while (c != '\n');
+		if (start_of_line != 0)
+			fputs(prefix, fp);
+		(void) fwrite(s, sizeof(*s), e - s, fp);
+		start_of_line = 1;
+		if (c == '&') {
+			start_of_line = 0;
+			fputs(argv0, fp);
+			c = *++e;
+		}
+		if (c == '\0') {
+			putc('\n', fp);
+			break;
+		}
+		s = e;
+	}
 }
 
-static int set_signals(void)
+void print_usage(void)
 {
-	static const struct {
-		int sig;
-		void (*handler)(int);
-	} hands[] = {
-		{ SIGHUP, got_signal },
-		{ SIGINT, got_signal },
-		{ SIGTERM, got_signal },
-		{ SIGPIPE, SIG_IGN },
-	};
+	static const char prefix[] = "\t";
+
+	fprintf(stderr, "%s: ", argv0);
+	if (subcommand != NULL) {
+		fprintf(stderr, "%s usage:\n", subcommand->cmd);
+		print_subcommand_usage(stderr, prefix, subcommand);
+	} else {
+		unsigned int i;
+		const struct gitfs_subcommand *sc;
+		fputs("usage:\n", stderr);
+		for (i = 0;; i++) {
+			sc = gitfs_subcommands[i];
+			if (sc == NULL)
+				break;
+			if (sc->cmd[0] != '_')
+				print_subcommand_usage(stderr, prefix, sc);
+		}
+	}
+	fputs(	"\n"
+		"Global options:\n"
+		"\t"	"-d : turn on debugging mode\n",
+		stderr);
+}
+
+static const struct gitfs_subcommand scmd_help;
+
+/*
+ * This is searched linearly at startup time, so its a good idea to keep
+ * commonly used commands near the top
+ */
+static const struct gitfs_subcommand *gitfs_subcommands[] = {
+	&scmd_mount,
+	&scmd_umount,
+	&scmd_help,
+	&scmd_pwd,
+	&scmd_gls,
+	/* debugging-only commands: */
+	&debug_cmd_dump_gobj,
+	&debug_cmd_dump_ino,
+	NULL,
+};
+
+static int subcommand_matches(const struct gitfs_subcommand *sc,
+			      const char *str)
+{
 	unsigned int i;
 
-	for (i = 0; i < (sizeof(hands) / sizeof(hands[0])); i++)
-		if (sigset(hands[i].sig, hands[i].handler) == SIG_ERR)
+	if (0 == strcmp(sc->cmd, str))
+		return 1;
+	if (sc->aliases == NULL)
+		return 0;
+	for (i = 0; sc->aliases[i] != NULL; i++)
+		if (0 == strcmp(sc->aliases[i], str))
+			return 1;
+	return 0;
+}
+
+static int cmd_help(UNUSED_ARG(int argn), char * const *argv)
+{
+	const struct gitfs_subcommand *sc;
+	unsigned int i;
+
+	if (argv[1] == NULL) {
+		int first = 1;
+		for (i = 0;; i++) {
+			sc = gitfs_subcommands[i];
+			if (sc == NULL)
+				break;
+			if (gitfs_debug == 0 && sc->cmd[0] == '_')
+				continue;
+			if (first == 0)
+				putchar('\n');
+			print_subcommand_usage(stdout, "", sc);
+			first = 0;
+		}
+	} else if (argv[2] != NULL) {
+		print_usage();
+		return 8;
+	} else {
+		for (i = 0;; i++) {
+			sc = gitfs_subcommands[i];
+			if (sc == NULL)
+				break;
+			if (subcommand_matches(sc, argv[1])) {
+				print_subcommand_usage(stdout, "", sc);
+				return 0;
+			}
+		}
+		fprintf(stderr, "%s: unknown command \"%s\"\n",
+			argv0, argv[1]);
+		return 4;
+	}
+	return 0;
+}
+static const char *help_aliases[] = { "?", NULL };
+static const struct gitfs_subcommand scmd_help = {
+	.cmd = "help",
+	.aliases = help_aliases,
+	.handler = &cmd_help,
+	.usage = "& [-d] help [<command>]",
+};
+
+/*
+ * We don't want to use getopt() for the top-level options since it can
+ * get confused when the sub-commands use it
+ */
+static int process_main_option(const char *opt)
+{
+	static int got_dashdash = 0;
+
+	if (got_dashdash != 0 || opt[0] != '-' || opt[1] == '\0')
+		return -1;
+	if (opt[1] == '-' && opt[2] == '\0') {
+		got_dashdash = 1;
+		return 0;
+	}
+	for (++opt; *opt != '\0'; opt++)
+		switch (*opt) {
+		case 'd':
+			gitfs_debug++;
+			break;
+		default:
+			print_usage();
 			return -1;
+		}
 	return 0;
 }
 
 int main(int argn, char * const *argv)
 {
-	const char *argv0;
-	int n;
-	int do_umount = 0;
-	int got_mount_arg = 0;
-	int run_in_foreground = 0;
+	unsigned int i;
 
-	argv0 = argv[0];
-	while (n = getopt(argn, argv, "fduO:"), n != EOF)
-		switch (n) {
-		case 'f':
-			run_in_foreground = 1;
-			break;
-		case 'd':
-			gitfs_debug = 1;
-			break;
-		case 'u':
-			do_umount = 1;
-			break;
-		case 'O':
-			ocache_dir = optarg;
-			got_mount_arg = 1;
-			break;
-		default:
-			print_usage(argv0);
+	argv0 = basename(argv[0]);
+	do {
+		argv++;
+		argn--;
+		if (argv[0] == NULL) {
+			print_usage();
 			return 8;
 		}
-	argv += optind;
-
-	if (do_umount != 0) {
-		if (argv[0] == NULL || argv[1] != NULL ||
-		    got_mount_arg != 0) {
-			print_usage(argv0);
+	} while (process_main_option(argv[0]) == 0);
+	for (i = 0;; i++) {
+		subcommand = gitfs_subcommands[i];
+		if (subcommand == NULL) {
+			print_usage();
 			return 8;
 		}
-		return api_umount(argv[0]);
+		if (subcommand_matches(subcommand, argv[0]))
+			break;
 	}
-	if (argv[0] == NULL || argv[1] == NULL || argv[2] != NULL) {
-		print_usage(argv0);
-		return 8;
-	}
-	if (chdir_to_git(argv[0]) != 0)
-		return 8;
-	if (prepare_git_environment() != 0)
-		return 8;
-	n = api_prepare_mount(argv[1]);
-	if (n != 0)
-		return n;
-	if (gitfs_debug == 0 && run_in_foreground == 0 && daemon(1, 0) != 0) {
-		perror("daemonize");
-		api_abandon_mount();
-		return 8;
-	}
-	if (set_signals() != 0) {
-		perror("sigset");
-		api_abandon_mount();
-		return 8;
-	}
-	return api_run_mount();
+	return subcommand->handler(argn, argv);
 }

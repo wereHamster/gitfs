@@ -7,18 +7,18 @@
  */
 
 #include "gitfs.h"
+#include <sys/stat.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <time.h>
 
 void gitdir_free(struct gitdir *gdir)
 {
 	free(gdir->entries);
-	free(gdir->backing_file);
+	free(gdir->backing_buf);
 }
 
-#include <stdio.h>
 /*
  * fills in "r" with the data based on the tree data at "data".  "*datalenp"
  * is left updated
@@ -113,7 +113,7 @@ int gitdir_parse(struct gitdir *gdir, unsigned char *data, size_t datalen)
 	assert(gdir->nentries == 0);
 	assert(gdir->nsubdirs == 0);
 	assert(gdir->entries == NULL);
-	gdir->backing_file = data;
+	gdir->backing_buf = data;
 	data += datalen;
 	while (datalen > 0) {
 		if (gdir->nentries >= nalloced) {
@@ -154,19 +154,17 @@ int gitdir_parse(struct gitdir *gdir, unsigned char *data, size_t datalen)
 	if (out_of_order != 0)
 		qsort(gdir->entries, gdir->nentries, sizeof(gdir->entries[0]),
 		      gitdir_entry_compare);
-	(void) time(&gdir->atime);
-	gdir->last_find = 0;
 	return 0;
 }
 
-struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name)
+struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name,
+				 unsigned int *last_findp)
 {
 	struct gitdir_entry *es;
 	unsigned int i;
 	int l, r, cr;
 
 	assert(gdir != NULL);
-	(void) time(&gdir->atime);
 	if (gdir->nentries == 0)
 		return NULL;
 	assert(gdir->entries != NULL);
@@ -177,7 +175,7 @@ struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name)
 	 * last time OR we're scanning the directory linearly and just want
 	 * the next entry
 	 */
-	i = gdir->last_find;
+	i = *last_findp;
 	assert(i < gdir->nentries);
 	es = &gdir->entries[i];
 	cr = strcmp(name, es->name);
@@ -190,7 +188,7 @@ struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name)
 		}
 		cr = strcmp(name, (++es)->name);
 		if (cr == 0) {
-			gdir->last_find = i;
+			*last_findp = i;
 			return es;
 		}
 		if (cr < 0)
@@ -209,7 +207,7 @@ struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name)
 		i = (l + r) / 2;
 		cr = strcmp(name, es[i].name);
 		if (cr == 0) {
-			gdir->last_find = i;
+			*last_findp = i;
 			return &es[i];
 		}
 		if (cr < 0)	/* name < current element */
@@ -220,15 +218,107 @@ struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name)
 	return NULL;
 }
 
-void gitdir_readdir(struct gitdir *gdir, struct api_readdir_state *ars)
+void gitdir_readdir(struct gitdir *gdir, struct gitfs_node *gn,
+		    struct api_readdir_state *ars)
 {
 	unsigned int i;
 
 	assert(gdir != NULL);
-	(void) time(&gdir->atime);
 	for (i = 0; i < gdir->nentries; i++) {
 		struct gitdir_entry *e = &gdir->entries[i];
-		if (api_add_dir_contents(ars, e->name, e->type) != 0)
+		if (api_add_dir_contents(ars, e->name, e->type,
+					 gn_child_inum(gn, e->name)) != 0)
 			break;
 	}
 }
+
+/* IMPLEMENTATION OF "gitfs gls" COMMAND: */
+
+static void gitdir_ls_add_one(struct pcbuf *out,
+			      const struct gitdir_entry *ge)
+{
+	pcbuf_write_obj(out, ge->type);
+	pcbuf_write_obj(out, ge->perm);
+	pcbuf_write_obj(out, ge->ptr->sha1);
+	pcbuf_write(out, ge->name, strlen(ge->name) + 1);
+}
+
+void gitdir_ls_answer(struct pcbuf *out, const struct gitfs_node *gn)
+{
+	static const struct gitobj_ptr eof_ptr = {
+		.sha1 = { 0 },
+	};
+	static const struct gitdir_entry eof_entry = {
+		.name = "",
+		.ptr = &eof_ptr,
+		.type = GFN_INCOMPLETE,
+		.perm = 0,
+	};
+
+	if (gn != NULL && gn->type == GFN_DIR && gn->backing.gobj != NULL) {
+		const struct gitdir *gdr = &gn->backing.gobj->d.dir;
+		unsigned int i;
+		for (i = 0; i < gdr->nentries; i++)
+			gitdir_ls_add_one(out, &gdr->entries[i]);
+	}
+	gitdir_ls_add_one(out, &eof_entry);
+}
+
+static enum service_result cmd_gls_worker(enum gitfs_node_type type,
+					  mode_t perm,
+					  const struct gitobj_ptr *ptr,
+					  const char *name)
+{
+	static const char permbit[9] = {
+		'x', 'w', 'r', 'x', 'w', 'r', 'x', 'w', 'r' };
+	struct gitobj_ptr_ascii gpa;
+	unsigned int i;
+	char typec;
+
+	typec = '?';
+	switch (type) {
+	case GFN_FILE:
+		typec = '-';
+		break;
+	case GFN_DIR:
+		typec = 'd';
+		break;
+	case GFN_SYMLINK:
+		typec = 'l';
+		break;
+	case GFN_INCOMPLETE:
+		/* This marks the end of input */
+		return SERVICED_EOF;
+	}
+	gitptr_ascii(&gpa, ptr);
+	fwrite(&gpa.ascii[0], 1, HEX_PTR_LEN, stdout);
+	printf(" %c", typec);
+	i = sizeof(permbit);
+	do {
+		i--;
+		putchar(((perm & (1 << i)) == 0) ? '-' : permbit[i]);
+	} while (i != 0);
+	putchar(' ');
+	puts(name);
+	return SERVICED_OK;
+}
+
+static int cmd_gls(UNUSED_ARG(int argn), char * const *argv)
+{
+	struct gitfs_server_connection *gsc;
+
+	if (argv[1] != NULL) {
+		print_usage();
+		return 4;
+	}
+	gsc = gs_connection_open();
+	if (gsc == NULL || gs_gls(gsc, 0, cmd_gls_worker) != 0)
+		return 8;
+	gs_connection_close(gsc);
+	return 0;
+}
+const struct gitfs_subcommand scmd_gls = {
+	.cmd = "gls",
+	.handler = &cmd_gls,
+	.usage = "& [-d] gls",
+};

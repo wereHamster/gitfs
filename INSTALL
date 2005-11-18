@@ -6,8 +6,8 @@ Prerequisites:
 
   * FUSE  --  http://fuse.sourceforge.net/
 
-    I'm currently using version 2.3.0.  I'm not sure if earlier versions will
-    work or not.
+    gitfs doesn't actually need the FUSE library but you still at least
+    need FUSE's "fusermount" helper program installed somewhere in your $PATH
 
     You also need to be running a kernel with FUSE filesystem support compiled
     in -- very recent mainline kernels now support this (CONFIG_FUSE_FS)
@@ -23,9 +23,8 @@ Next, edit the first few lines of Makefile to suit:
     git.  Probably you'll just need to point GITDIR at the directory your
     git tools were built at (including libgit.a and cache.h)
 
- FUSECFLAGS, FUSELDFLAGS -- flags required to compile and link against fuse.
-    Hopefully if you did a "make install" the fuse files should be installed
-    into /usr/local already and you won't need to change these
+ FUSECFLAGS -- flags required to compile against fuse.  Just set FUSE_HEADER
+    to point at a copy of the <linux/fuse.h> header from a recent 2.6 kernel
 
 Finally, just do a "make" and you should have a working gitfs binary.  Good
 luck.

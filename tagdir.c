@@ -13,20 +13,21 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 struct git_tag {
 	unsigned int levels_back;	/* Number of "../" to put in link */
 	struct gitobj_ptr obj;
-	time_t ctime, atime, mtime;
+	struct timespec ctim, atim, mtim;
 };
 
 static int tag_stat(struct gitfs_node *gn, struct stat *st)
 {
 	assert(gn->type == GFN_SYMLINK);
 	assert(gn->priv.gt != NULL);
-	st->st_ctime = gn->priv.gt->ctime;
-	st->st_atime = gn->priv.gt->atime;
-	st->st_mtime = gn->priv.gt->mtime;
+	st->st_ctim = gn->priv.gt->ctim;
+	st->st_atim = gn->priv.gt->atim;
+	st->st_mtim = gn->priv.gt->mtim;
 	return 0;
 }
 
@@ -81,9 +82,6 @@ static int tag_readlink(struct gitfs_node *gn, char *result, size_t *rlen)
 
 struct git_tag_dir {
 	const char *path;
-	// TODO - store strlen(path)?
-	// struct git_tag_link *root;	// TODO - needed?
-	// time_t dir_mtime;		// TODO - needed?
 };
 
 static int tagdir_stat(struct gitfs_node *gn, struct stat *st)
@@ -104,11 +102,11 @@ static int tagdir_stat(struct gitfs_node *gn, struct stat *st)
 static int tagdir_lookup(struct gitfs_node *parent,
 			 struct gitfs_node **resultp, const char *name)
 {
-	static const struct gitfs_common_ops common_ops = {
-		.stat = tag_stat,
-		.destroy = tag_destroy,
-	};
 	static const struct gitfs_symlink_ops symlink_ops = {
+		.common = {
+			.stat = tag_stat,
+			.destroy = tag_destroy,
+		},
 		.readlink = tag_readlink,
 		.link_len = tag_link_len,
 	};
@@ -134,15 +132,15 @@ static int tagdir_lookup(struct gitfs_node *parent,
 	if (gt == NULL)
 		return -ENOMEM;
 	gt->levels_back = 1;
-	gt->ctime = bst.st_ctime;
-	gt->atime = bst.st_atime;
-	gt->mtime = bst.st_mtime;
-	*resultp = gn_alloc(GFN_SYMLINK);
+	gt->ctim = bst.st_ctim;
+	gt->atim = bst.st_atim;
+	gt->mtim = bst.st_mtim;
+	*resultp = gn_alloc(parent, name);
 	if (*resultp == NULL) {
 		free(gt);
 		return -ENOMEM;
 	}
-	(*resultp)->opc = &common_ops;
+	(*resultp)->type = GFN_SYMLINK;
 	(*resultp)->op.sl = &symlink_ops;
 	(*resultp)->priv.gt = gt;
 	fd = open(bfile, O_RDONLY);
@@ -167,9 +165,6 @@ static int tagdir_readdir(struct gitfs_node *gn,
 			  struct api_readdir_state *ars)
 {
 	DIR *dp;
-	struct dirent *de;
-	struct stat st;
-	char bfile[PATH_MAX];
 
 	assert(gn->type == GFN_DIR);
 	assert(gn->priv.gtd != NULL);
@@ -178,10 +173,11 @@ static int tagdir_readdir(struct gitfs_node *gn,
 	if (dp == NULL)
 		return neg_errno();
 	for (;;) {
-		de = readdir(dp);
+		struct stat st;
+		char bfile[PATH_MAX];
+		struct dirent *de = readdir(dp);
 		if (de == NULL)
 			break;
-		// TODO - it would be more efficient to just copy dir once
 		if (create_fullpath(bfile, sizeof(bfile),
 				    gn->priv.gtd->path, de->d_name) != 0)
 			continue;
@@ -199,7 +195,8 @@ static int tagdir_readdir(struct gitfs_node *gn,
 			continue;
 		if (st.st_size > HEX_PTR_LEN + 2)
 			continue;
-		if (api_add_dir_contents(ars, de->d_name, GFN_SYMLINK) != 0)
+		if (api_add_dir_contents(ars, de->d_name, GFN_SYMLINK,
+					 gn_child_inum(gn, de->d_name)) != 0)
 			break;
 	}
 	if (closedir(dp) != 0)
@@ -207,57 +204,43 @@ static int tagdir_readdir(struct gitfs_node *gn,
 	return 0;
 }
 
-static const struct gitfs_common_ops tagdir_common_ops = {
-	.stat = tagdir_stat,
-};
-static const struct gitfs_dir_ops tagdir_dir_ops = {
-	.lookup = tagdir_lookup,
-	.readdir = tagdir_readdir,
-};
-
-/* Stuff for the TAGS/ directory */
-static struct git_tag_dir dirinfo_tags = {
-	.path = "refs/tags",
-};
-static struct gitfs_node tagdir_tags = {
-	.type = GFN_DIR,
-	.opc = &tagdir_common_ops,
-	.op.d = &tagdir_dir_ops,
-	.hold_count = 1,
-	.priv.gtd = &dirinfo_tags,
-};
-/* Ditto for the HEADS/ directory */
-static struct git_tag_dir dirinfo_heads = {
-	.path = "refs/heads",
-};
-static struct gitfs_node tagdir_heads = {
-	.type = GFN_DIR,
-	.opc = &tagdir_common_ops,
-	.op.d = &tagdir_dir_ops,
-	.hold_count = 1,
-	.priv.gtd = &dirinfo_heads,
-};
-
-/*
- * This is what binds our statically-defined gitfs_nodes to an actual
- * location in the root directory
- */
+#define DEFINE_TAGDIR(tname, tpath)					\
+		{ .name = tname, .priv = { .path = tpath } }
 static struct {
 	const char *name;
-	struct gitfs_node *node;
+	struct git_tag_dir priv;
+	struct gitfs_node *gn;
 } tagdirs[] = {
-	{ "TAGS", &tagdir_tags },
-	{ "HEADS", &tagdir_heads },
+	DEFINE_TAGDIR("TAGS", "refs/tags"),
+	DEFINE_TAGDIR("HEADS", "refs/heads"),
 };
 #define num_tagdirs	(sizeof(tagdirs) / sizeof(tagdirs[0]))
 
 int tagroot_lookup(struct gitfs_node **resultp, const char *name)
 {
+	static const struct gitfs_dir_ops tagdir_dir_ops = {
+		.common = {
+			.stat = tagdir_stat,
+		},
+		.lookup = tagdir_lookup,
+		.readdir = tagdir_readdir,
+	};
 	unsigned int i;
 
 	for (i = 0; i < num_tagdirs; i++)
 		if (0 == strcmp(name, tagdirs[i].name)) {
-			*resultp = tagdirs[i].node;
+			assert(tagdirs[i].gn == NULL);
+			tagdirs[i].gn = gn_alloc(&gitfs_node_root, name);
+			*resultp = tagdirs[i].gn;
+			if (*resultp == NULL)
+				return -ENOMEM;
+			gn_set_type(*resultp, GFN_DIR);
+			(*resultp)->op.d = &tagdir_dir_ops;
+			(*resultp)->priv.gtd = &tagdirs[i].priv;
+			/*
+			 * We take an extra reference so this gnode will
+			 * stick around forever
+			 */
 			gn_hold(*resultp);
 			return 0;
 		}
@@ -269,7 +252,9 @@ void tagroot_readdir(struct api_readdir_state *ars)
 	unsigned int i;
 
 	for (i = 0; i < num_tagdirs; i++)
-		if (api_add_dir_contents(ars, tagdirs[i].name, GFN_DIR) != 0)
+		if (api_add_dir_contents(ars, tagdirs[i].name, GFN_DIR,
+			(tagdirs[i].gn == NULL) ? (uint64_t) -1
+						: tagdirs[i].gn->inum) != 0)
 			break;
 }
 

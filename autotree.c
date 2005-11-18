@@ -9,7 +9,6 @@
 #include "gitfs.h"
 #include <string.h>
 #include <errno.h>
-#include <time.h>
 #include "cache.h"	/* from git core */
 
 // TODO -- we really need a better data structure than a linked list soon!
@@ -21,7 +20,7 @@ struct autotree {
 static struct autotree *autotree_root = NULL;
 static unsigned int autotree_numdirs = 0;  /* number of directory objects */
 
-static const int automount_expire = 120; /* TODO - make settable, and longer */
+static const int automount_expire = 120; /* TODO: make settable, and longer */
 
 unsigned int autotree_count_subdirs(void)
 {
@@ -61,7 +60,8 @@ void autotree_readdir(struct api_readdir_state *ars)
 		}
 		assert(i * 2 == HEX_PTR_LEN);
 		name[HEX_PTR_LEN] = '\0';
-		if (api_add_dir_contents(ars, name, GFN_DIR) != 0)
+		if (api_add_dir_contents(ars, name,
+					 GFN_DIR, GITFS_NO_INUM) != 0)
 			break;
 		ap = &(*ap)->next;
 	}
@@ -89,18 +89,27 @@ static int touch_or_add(const struct gitobj_ptr *ptr)
 	return 0;
 }
 
+static int finish_autotree_lookup(int error, struct gitfs_node *gn)
+{
+	assert(error <= 0);
+	if (error == 0 && gn->type == GFN_DIR) {
+		error = touch_or_add(&gn->backing.gobj->hash);
+		if (error != 0)
+			gn_release(gn);
+	}
+	return error;
+}
+
 int autotree_lookup(struct gitfs_node **resultp, const char *name)
 {
 	struct gitobj_ptr ptr;
-	int ret;
 
-	if (get_sha1_hex(name, &ptr.sha1[0]) != 0 || name[HEX_PTR_LEN] != '\0')
+	if (get_sha1_hex(name, &ptr.sha1[0]) != 0 ||
+	    name[HEX_PTR_LEN] != '\0')
 		return -ENOENT;
-	ret = gitobj_lookup_byptr(&ptr, resultp, NULL);
-	if (ret == 0 && (*resultp)->type == GFN_DIR) {
-		ret = touch_or_add(&ptr);
-		if (ret != 0)
-			gn_release(*resultp);
-	}
-	return ret;
+	*resultp = gn_alloc(&gitfs_node_root, name);
+	if (*resultp == NULL)
+		return -ENOMEM;
+	return gitobj_lookup_byptr(&ptr, *resultp, GFN_INCOMPLETE,
+				   (mode_t) -1, finish_autotree_lookup);
 }
