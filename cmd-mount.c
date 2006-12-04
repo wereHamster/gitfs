@@ -6,7 +6,7 @@
  *  See the file COPYING.
  */
 
-#define _GNU_SOURCE		/* for sigset() */
+#define _GNU_SOURCE		/* for sigset(), canonicalize_file_name() */
 #include "gitfs.h"
 #include "defaults.h"
 #include <sys/epoll.h>
@@ -55,8 +55,99 @@ static int chdir_to_git(const char *path)
 	return 0;
 }
 
-int gitfs_read_only = 0;
-const char *ocache_dir = DEFAULT_OBJECT_CACHE_DIR;
+static unsigned int count_path_elements(const char *path)
+{
+	unsigned int answer = 0;
+
+	if (*path == '\0')
+		goto done;
+	for (;;) {
+		answer++;
+		do {
+			if (*++path == '\0')
+				goto done;
+		} while (*path != '/');
+	}
+    done:
+	return answer;
+}
+
+char *relative_path_to_gitdir;
+size_t relative_path_to_gitdir_len;
+
+/*
+ * Initialize "relative_path_to_git" to be a relative pathname for reaching
+ * the current directory (i.e. the ".git/" dir) suitable for making symlinks
+ */
+static int mk_relative_path_to_gitdir(const char *mntpt)
+{
+	char *curpath, *v;
+	size_t mskip, cskip;
+	unsigned int dotdot_needed;
+
+	curpath = canonicalize_file_name(".");
+	if (curpath == NULL) {
+		perror("getting current path");
+		return -1;
+	}
+	assert(mntpt[0] == '/');
+	assert(curpath[0] == '/');
+	mskip = cskip = 1;
+	for (;;) {
+		size_t elemsize;
+		const char *p;
+		if (mntpt[mskip] == '/') {
+			mskip++;
+			continue;
+		}
+		if (curpath[cskip] == '/') {
+			cskip++;
+			continue;
+		}
+		if (mntpt[mskip] == '\0' || curpath[cskip] == '\0')
+			break;
+		/* find the size of the current element */
+		p = &mntpt[mskip];
+		do {
+			p++;
+		} while (*p != '/' && *p != '\0');
+		elemsize = p - &mntpt[mskip];
+		assert(elemsize > 0);
+		if (0 != memcmp(&mntpt[mskip], &curpath[cskip], elemsize))
+			break;
+		p = &curpath[cskip + elemsize];
+		if (*p != '/' && *p != '\0')
+			break;
+		mskip += elemsize;
+		cskip += elemsize;
+	}
+	dotdot_needed = count_path_elements(&mntpt[mskip]);
+	mskip = strlen(&curpath[cskip]);	/* reusing here... */
+	relative_path_to_gitdir = malloc(
+		(strlen_const("../") * dotdot_needed) + mskip + 2);
+	if (relative_path_to_gitdir == NULL) {
+		perror("allocating memory for relative_path_to_gitdir");
+		free(curpath);
+		return -1;
+	}
+	v = relative_path_to_gitdir;
+	while (dotdot_needed-- != 0) {
+		*v++ = '.';
+		*v++ = '.';
+		*v++ = '/';
+	}
+	if (mskip != 0) {
+		memcpy(v, &curpath[cskip], mskip);
+		v += mskip;
+		*v++ = '/';
+	}
+	*v = '\0';
+	free(curpath);
+	relative_path_to_gitdir_len = v - relative_path_to_gitdir;
+	return 0;
+}
+
+const char *ocache_dir = DEFAULT_OBJECT_CACHE_DIR;	// TODO allow override
 
 static int selfpipe_fds[2];
 #define SELFPIPE_CHECK	(selfpipe_fds[0])
@@ -210,17 +301,25 @@ static int cmd_mount(int argn, char * const *argv)
 	int n, mntfd;
 	int run_in_foreground = 0;
 	enum service_result res = SERVICED_OK;
+	char *mount_location;
+	static const struct gitcmd_option mount_opts[] = {
+		{
+			.name = "ro",
+			.type = GOP_BOOL,
+		},
+	};
 
-	while (n = getopt(argn, argv, "rFO:"), n != EOF)
+	while (n = getopt(argn, argv, "Fro:"), n != EOF)
 		switch (n) {
-		case 'r':
-			gitfs_read_only = 1;
-			break;
 		case 'F':
 			run_in_foreground = 1;
 			break;
-		case 'O':
-			ocache_dir = optarg;
+		case 'r':
+			*((const char **) &optarg) = "ro";
+			/* FALLTHROUGH */
+		case 'o':
+			if (add_command_line_option(optarg) != 0)
+				return 8;
 			break;
 		default:
 			print_usage();
@@ -232,9 +331,18 @@ static int cmd_mount(int argn, char * const *argv)
 		return 8;
 	}
 	mk_instance_str();
+	mount_location = canonicalize_file_name(argv[1]);
+	if (mount_location == NULL) {
+		perror("can't resolve mount location");
+		return 4;
+	}
 	if (chdir_to_git(argv[0]) != 0)
 		return 8;
+	if (mk_relative_path_to_gitdir(mount_location) != 0)
+		return 8;
 	if (prepare_git_environment() != 0)
+		return 8;
+	if (gitfs_server_read_config() != 0)
 		return 8;
 	epoll_fd = epoll_create(20);
 	if (epoll_fd < 0) {
@@ -243,11 +351,10 @@ static int cmd_mount(int argn, char * const *argv)
 	}
 	if (csipc_init() != 0) {
 		close(epoll_fd);
-		gitwork_fini();
 		return 8;
 	}
-	mntfd = api_open_mount(argv[1], gitfs_read_only);
-	if (mntfd < 0) {
+	n = server_conf_bool_validate("ro", mount_opts, 0);
+	if (n < 0 || (mntfd = api_open_mount(mount_location, n)) < 0) {
 		close(epoll_fd);
 		csipc_fini();
 		return 4;
@@ -269,6 +376,7 @@ static int cmd_mount(int argn, char * const *argv)
 		api_umount();
 		close(epoll_fd);
 		csipc_fini();
+		gitwork_fini();
 		return 8;
 	}
 	if (set_signals() != 0) {
@@ -319,10 +427,11 @@ const struct gitfs_subcommand scmd_mount = {
 	.aliases = mount_aliases,
 	.handler = &cmd_mount,
 	.usage =
-	  "& [-d] mount [-r] [-F] [-O <ocache_dir>] <gitdir> <mntpoint>\n"
+	  "& [-d] mount [-r] [-F] [-o <option>[=<value>]] "
+						"<gitdir> <mntpoint>\n"
 	  "\t"	"-r : mount read-only\n"
 	  "\t"	"-F : run in foreground, unmount on clean exit\n"
-	  "\t"	"-O : specify object cache directory",
+	  "\t"	"-o : override configuration option",
 };
 
 static int cmd_umount(UNUSED_ARG(int argn), char * const *argv)

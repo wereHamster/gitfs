@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -41,7 +41,7 @@ static void print_subcommand_usage(FILE *fp, const char *prefix,
 		} while (c != '\n');
 		if (start_of_line != 0)
 			fputs(prefix, fp);
-		(void) fwrite(s, sizeof(*s), e - s, fp);
+		(void) fwrite(s, sizeof(*s), (size_t) (e - s), fp);
 		start_of_line = 1;
 		if (c == '&') {
 			start_of_line = 0;

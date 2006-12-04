@@ -1,4 +1,4 @@
-GITFS pre-release version 0.03
+GITFS pre-release version 0.04
 
 gitfs is a FUSE-based filesystem for working with source trees stored in
 git repositories.  The eventual goal is to provide a convenient way to work
@@ -111,6 +111,6 @@ EXAMPLE SESSION
   24d761518d864643d0ff1564d4e516b8db4bbeda -rw-r--r-- fuse_i.h
   e69a546844d0f23770f3dd5e690f20284a27cd01 -rw-r--r-- inode.c
   $ gitfs pwd
-  2b10839e32c4c476e9d94492756bb1a3e1ec4aa8/fs/fuse
+  TAGS:v2.6.14:2b10839e32c4c476e9d94492756bb1a3e1ec4aa8/fs/fuse
   $ cd /
   $ gitfs umount /tmp/fuse

@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -128,7 +128,7 @@ struct rb_tree {
 }
 extern const struct rb_tree empty_rbtree;
 
-extern void rbtree_insert(struct rb_node **link, struct rb_node *node);
+extern void rbtree_insert(struct rb_node **linkp, struct rb_node *node);
 extern void rbtree_delete(struct rb_node *node);
 
 /*
@@ -170,7 +170,7 @@ struct bytebuf {
 	int error;
 };
 
-#define bytebuf_len(bb)		((bb)->stored.end - (bb)->stored.start)
+#define bytebuf_len(bb)	  ((size_t) ((bb)->stored.end - (bb)->stored.start))
 extern void bytebuf_init(struct bytebuf *bb,
 			 size_t space_before, size_t space_after);
 extern void bytebuf_destroy(struct bytebuf *bb);
@@ -184,7 +184,7 @@ extern char *bytebuf_asptr(struct bytebuf *bb);
  * For pcbuf.c *
  ***************/
 
-struct pcbuf_elem;
+struct pcbuf_elem;			/* opaque outside pcbuf.c */
 
 struct pcbuf {
 	struct {
@@ -299,7 +299,7 @@ extern int gitdir_parse(struct gitdir *gdir, unsigned char *data,
 extern void gitdir_free(struct gitdir *gdir);
 extern struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name,
 					unsigned int *last_findp);
-extern void gitdir_readdir(struct gitdir *gdir, struct gitfs_node *gn,
+extern void gitdir_readdir(const struct gitdir *gdir, struct gitfs_node *gn,
 			   struct api_readdir_state *ars);
 
 extern void gitdir_ls_answer(struct pcbuf *out, const struct gitfs_node *gn);
@@ -309,7 +309,7 @@ extern const struct gitfs_subcommand scmd_gls;
  * For gitobj.c *
  ****************/
 
-struct gitobj_pending_request;		/* opaque to gitobj.c */
+struct gitobj_pending_request;		/* opaque outside gitobj.c */
 
 struct gitobj {
 	unsigned long hold_count;
@@ -414,6 +414,9 @@ struct gitfs_saved_node {
 
 extern void gn_save_node(struct gitfs_saved_node *sn, struct gitfs_node *gn);
 extern void gn_unsave_node(struct gitfs_saved_node *sn);
+extern void gn_save_node_noref(struct gitfs_saved_node *sn,
+			       struct gitfs_node *gn);
+extern void gn_unsave_node_noref(struct gitfs_saved_node *sn);
 
 struct gitfs_common_ops {
 	int (*stat)(struct gitfs_node *gn, struct stat *sbuf);
@@ -424,6 +427,11 @@ struct gitfs_file_ops {
 	struct gitfs_common_ops common;		/* must be first! */
 	int (*open)(struct gitfs_node *gn, unsigned int flags);
 	void (*close)(struct gitfs_node *gn);
+	/*
+	 * Note: ->{pread,pwrite}() use a (signed) off_t offset to match the
+	 * libc functions of the same name.  However, the API layer is
+	 * responsible for ensuring that the offset is actually positive
+	 */
 	int (*pread)(struct gitfs_node *gn,
 		     void *buf, size_t size, off_t offset);
 	int (*pwrite)(struct gitfs_node *gn,
@@ -455,20 +463,11 @@ struct gitfs_symlink_ops {
 	size_t (*link_len)(struct gitfs_node *gn);
 };
 
-/* Forward declarations for things that can go in gn->priv: */
-struct git_tag;
-struct git_tag_dir;
-struct gn_defered_incomplete_lookup;	/* private to gnode.c */
-
-/*
- * Note: this structure doesn't need to be refcounted -- we only free it when
- * we're freeing it's "root" node in gn_release_nref().
- */
-struct gitfs_tree {
-	struct gitfs_saved_node root;
-	char *symbolic_name;
-	char *backing_path;
-};
+/* Forward declarations */
+struct gitfs_view;			/* opaque outside view.c */
+struct git_tag;				/* opaque outside tagdir.c */
+struct git_tag_dir;			/* opaque outside tagdir.c */
+struct gn_defered_incomplete_lookup;	/* opaque outside gnode.c */
 
 struct gitfs_fs_backing {
 	struct openfile of;
@@ -483,7 +482,7 @@ struct gitfs_node {
 	unsigned long hold_count;
 	unsigned long open_count;
 	enum gitfs_node_type type;
-	struct gitfs_tree *tree;
+	struct gitfs_view *view;
 	union {
 		const struct gitfs_common_ops *c;
 		const struct gitfs_file_ops *f;
@@ -540,9 +539,6 @@ struct gitfs_node {
 	char name[0];		/* must be last! */
 };
 
-#define gn_is_treeroot(ggn) ((ggn)->tree != NULL &&			\
-			     (ggn)->tree->root.gn == ggn)
-
 #define gn_hold(gn)	do { (gn)->hold_count++; } while (0)
 extern void gn_release_nref(struct gitfs_node *gn, unsigned int refcnt);
 #define gn_release(gn)	gn_release_nref((gn), 1)
@@ -559,6 +555,7 @@ do {									\
 } while (0)
 
 extern struct gitfs_node *gn_lookup_inum(gitfs_inum_t inum);
+extern int gn_name_exists_in_root(const char *name);
 extern struct gitfs_node *gn_alloc(struct gitfs_node *parent,
 				   const char *name);
 extern void gn_set_type(struct gitfs_node *gn, enum gitfs_node_type ntype);
@@ -566,13 +563,31 @@ extern int gn_lookup_in(struct gitfs_node *parent, const char *elem,
 			struct gitfs_node **resultp);
 extern void gn_finish_defered_lookups(struct gitfs_node *parent,
 				      struct api_request *req, int error);
-extern gitfs_inum_t gn_child_inum(struct gitfs_node *gn, const char *elem);
+extern int gn_add_dir_contents(struct gitfs_node *parent,
+			       struct api_readdir_state *rs, const char *elem,
+			       enum gitfs_node_type type);
 extern int gn_change_name(struct gitfs_node **gnp, const char *newname);
+extern unsigned int gn_dirlevel(const struct gitfs_node *gn);
 extern const struct gitfs_subcommand scmd_pwd;
 extern void ino_dump_single_answer(struct pcbuf *out,
 				   const struct gitfs_node *gn);
 extern void ino_dump_answer(struct pcbuf *out);
 extern const struct gitfs_subcommand debug_cmd_dump_ino;
+
+/**************
+ * For view.c *
+ **************/
+
+extern int gn_is_viewroot(const struct gitfs_node *gn);
+extern void gitview_free(struct gitfs_node *gn);
+extern int gitview_start_readonly(struct gitfs_node *gn);
+extern int gitview_lookup(struct gitfs_node *parent,
+			  struct gitfs_node **result,
+			  const char *name);
+extern void gitview_readdir(struct gitfs_node *gn,
+			    struct api_readdir_state *ars);
+extern void gitview_get_info(struct pcbuf *out,
+			     const struct gitfs_view *gview);
 
 /****************
  * For topdir.c *
@@ -647,9 +662,10 @@ extern void api_saved_request_set_gnode(struct api_request *ipc,
  * For cmd-mount.c *
  *******************/
 
-extern int gitfs_read_only;
 extern const char *ocache_dir;
 extern char instance_str[];
+extern char *relative_path_to_gitdir;
+extern size_t relative_path_to_gitdir_len;
 extern void selfpipe_ping(void);
 extern int epoll_add(int fd, void *token);
 extern int epoll_mod(int fd, void *token, int newmode);
@@ -693,7 +709,7 @@ extern csipc_fh_t gs_dupfd(struct gitfs_server_connection *gsc,
 			   csipc_fh_t fh);
 extern int gs_getname(struct gitfs_server_connection *gsc, csipc_fh_t fh,
 		      char *buf, size_t buflen);
-extern int gs_cdup(const struct gitfs_server_connection *gsc, csipc_fh_t fh);
+extern int gs_cd_up(const struct gitfs_server_connection *gsc, csipc_fh_t fh);
 extern int gs_dump_gobj(struct gitfs_server_connection *gsc,
 			const struct gobj_dump_filter *filt,
 			void *buf, size_t buflen,
@@ -717,6 +733,105 @@ extern int gs_dump_ino(struct gitfs_server_connection *gsc,
 						   const char *name,
 						   void *state),
 		       void *state);
-extern int gs_is_treeroot(struct gitfs_server_connection *gsc, csipc_fh_t fh);
+extern int gs_is_viewroot(struct gitfs_server_connection *gsc, csipc_fh_t fh);
+
+struct gs_view_info {
+	struct gitobj_ptr hash;
+	char symbolic_name[0];
+};
+extern int gs_get_view_info(struct gitfs_server_connection *gsc,
+			    csipc_fh_t fh, struct gs_view_info *vinfo,
+			    size_t reslen);
+extern int gs_conf_raw_fetch(struct gitfs_server_connection *gsc,
+			     const char *var, char *result, size_t reslen);
+
+/**************
+ * For conf.c *
+ **************/
+
+struct gitcmd_option {
+	const char *name;
+	enum {
+		GOP_BOOL,
+		GOP_UINT,
+		GOP_STRING,
+	} type;
+	struct {
+		uint64_t min, max;
+	} range;
+	int (*validate)(const struct gitcmd_option *gop, const char *val);
+};
+
+extern int add_command_line_option(const char *ostr);
+extern int gitfs_server_read_config(void);
+extern void conf_answer_client_query(struct pcbuf *out, const char *var);
+
+#define CONF_VLIST_ARG(arg)	(arg), (sizeof(arg) / sizeof((arg)[0]))
+
+extern int validate_command_line_options_wcount(
+			const struct gitcmd_option *list, unsigned int count);
+#define validate_command_line_options(vlist)			\
+		validate_command_line_options_wcount(CONF_VLIST_ARG(vlist))
+
+extern int server_conf_bool_wvalid(const char *var,
+				   const struct gitcmd_option *list,
+				   unsigned int count, int defval);
+#define server_conf_bool(var, defval)					\
+		server_conf_bool_wvalid((var), NULL, 0, (defval))
+#define server_conf_bool_validate(var, vlist, defval)			\
+		server_conf_bool_wvalid((var),				\
+					CONF_VLIST_ARG(vlist), (defval))
+
+extern int server_conf_uint_wvalid(const char *var, uint64_t *resultp,
+				   const struct gitcmd_option *list,
+				   unsigned int count, uint64_t defval);
+#define server_conf_uint(var, resultp, defval)				\
+		server_conf_uint_wvalid((var), (resultp), NULL, 0, (defval))
+#define server_conf_uint_validate(var, resultp, vlist, defval)		\
+		server_conf_uint_wvalid((var), (resultp),		\
+					CONF_VLIST_ARG(vlist), (defval))
+
+extern int server_conf_str_wvalid(const char *var, char *buf, size_t buflen,
+				  const struct gitcmd_option *list,
+				  unsigned int count, const char *defval);
+#define server_conf_str(var, buf, buflen, defval)			\
+		server_conf_str_wvalid((var), (buf), (buflen),		\
+					NULL, 0, (defval))
+#define server_conf_str_validate(var, buf, buflen, vlist, defval)	\
+		server_conf_str_wvalid((var), (buf), (buflen),		\
+					CONF_VLIST_ARG(vlist), (defval))
+
+extern int gs_conf_bool_wvalid(struct gitfs_server_connection *gsc,
+			       const char *var,
+			       const struct gitcmd_option *list,
+			       unsigned int count, int defval);
+#define gs_conf_bool(gsc, var, defval)					\
+		gs_conf_bool_wvalid((gsc), (var), NULL, 0, (defval))
+#define gs_conf_bool_validate(gsc, var, vlist, defval)			\
+		gs_conf_bool_wvalid((gsc), (var),			\
+					CONF_VLIST_ARG(vlist), (defval))
+
+extern int gs_conf_uint_wvalid(struct gitfs_server_connection *gsc,
+			       const char *var, uint64_t *resultp,
+			       const struct gitcmd_option *list,
+			       unsigned int count, uint64_t defval);
+#define gs_conf_uint(gsc, var, resultp, defval)				\
+		gs_conf_uint_wvalid((gsc), (var), (resultp),		\
+					NULL, 0, (defval))
+#define gs_conf_uint_validate(gsc, var, resultp, vlist, defval)		\
+		gs_conf_uint_wvalid((gsc), (var), (resultp),		\
+					CONF_VLIST_ARG(vlist), (defval))
+
+extern int gs_conf_str_wvalid(struct gitfs_server_connection *gsc,
+			      const char *var, char *buf, size_t buflen,
+			      const struct gitcmd_option *list,
+			      unsigned int count, const char *defval);
+#define gs_conf_str(gsc, var, buf, buflen, defval)			\
+		gs_conf_str_wvalid((gsc), (var), (buf), (buflen),	\
+					NULL, 0, (defval))
+#define gs_conf_str_validate(gsc, var, buf, buflen, vlist, defval)	\
+		gs_conf_str_wvalid((gsc), (var), (buf), (buflen),	\
+					CONF_VLIST_ARG(vlist), (defval))
+
 
 #endif /* !GOT_GITFS_H */

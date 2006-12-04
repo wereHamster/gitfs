@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -228,7 +228,7 @@ int copy_fd_to_fname(int rfd, const char *dst)
 		return neg_errno();
 	wfd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0644);
 	if (wfd < 0) {
-		int ret = neg_errno();
+		ret = neg_errno();
 		(void) munmap(p, st.st_size);
 		return ret;
 	}

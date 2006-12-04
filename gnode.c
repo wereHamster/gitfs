@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -13,32 +13,56 @@
 #include <string.h>
 #include <errno.h>
 
+static inline void add_to_savenodes(struct gitfs_saved_node *sn,
+				    struct gitfs_node *gn)
+{
+	gn_assert_held(gn);
+	sn->prevp = &gn->saved_node_root;
+	sn->next = gn->saved_node_root;
+	if (sn->next != NULL) {
+		assert(sn->next->gn == gn);
+		assert(sn->next->prevp == &gn->saved_node_root);
+		sn->next->prevp = &sn->next;
+	}
+	gn->saved_node_root = sn;
+}
+
 void gn_save_node(struct gitfs_saved_node *sn, struct gitfs_node *gn)
 {
 	sn->gn = gn;
 	if (gn != NULL) {
-		gn_assert_held(gn);
+		add_to_savenodes(sn, gn);
 		gn_hold(gn);
-		sn->prevp = &gn->saved_node_root;
-		sn->next = gn->saved_node_root;
-		if (sn->next != NULL) {
-			assert(sn->next->gn == gn);
-			assert(sn->next->prevp == &gn->saved_node_root);
-			sn->next->prevp = &sn->next;
-		}
-		gn->saved_node_root = sn;
+	}
+}
+
+/*
+ * Similar to the above but requires that gn is not NULL and does NOT
+ * take a reference to it.  This is designed for the "gitfs_view"
+ * structure -- if we took a reference to our root there it would never
+ * be freeable!
+ */
+void gn_save_node_noref(struct gitfs_saved_node *sn, struct gitfs_node *gn)
+{
+	assert(gn != NULL);
+	sn->gn = gn;
+	add_to_savenodes(sn, gn);
+}
+
+void gn_unsave_node_noref(struct gitfs_saved_node *sn)
+{
+	*(sn->prevp) = sn->next;
+	if (sn->next != NULL) {
+		assert(sn->next->gn == sn->gn);
+		assert(sn->next->prevp == &sn->next);
+		sn->next->prevp = sn->prevp;
 	}
 }
 
 void gn_unsave_node(struct gitfs_saved_node *sn)
 {
 	if (sn->gn != NULL) {
-		*(sn->prevp) = sn->next;
-		if (sn->next != NULL) {
-			assert(sn->next->gn == sn->gn);
-			assert(sn->next->prevp == &sn->next);
-			sn->next->prevp = sn->prevp;
-		}
+		gn_unsave_node_noref(sn);
 		gn_release(sn->gn);
 	}
 }
@@ -158,6 +182,11 @@ static struct rb_node **childlist_walk(struct gitfs_node *parent,
 	return rp;
 }
 
+int gn_name_exists_in_root(const char *name)
+{
+	return !RB_IS_NIL(*childlist_walk(&gitfs_node_root, name));
+}
+
 static inline struct gitfs_node *childlist_lookup(struct gitfs_node *gn,
 						  const char *name)
 {
@@ -197,7 +226,7 @@ struct gitfs_node *gn_alloc(struct gitfs_node *parent, const char *name)
 		gn_assign_inum(gn);
 		memcpy(&gn[1], name, namelenz);
 		childlist_add(parent, gn);
-		gn->tree = parent->tree;
+		gn->view = parent->view;
 		openfile_init(&gn->backing.file.of);
 		gn_hold(parent);
 	}
@@ -211,13 +240,6 @@ void gn_set_type(struct gitfs_node *gn, enum gitfs_node_type ntype)
 	gn->type = ntype;
 	if (ntype == GFN_DIR)
 		gn->t.d.children = empty_rbtree;
-}
-
-static void gtree_free(struct gitfs_tree *gtree)
-{
-	free(gtree->symbolic_name);
-	free(gtree->backing_path);
-	free(gtree);
 }
 
 static void fsback_free(struct gitfs_fs_backing *fsb)
@@ -235,7 +257,6 @@ void gn_release_nref(struct gitfs_node *gn, unsigned int refcnt)
 		if (gn->hold_count != 0)
 			break;		/* We're still held by someone */
 		assert(gn->parent != gn);
-		assert(gn->saved_node_root == NULL);
 		assert(gn->type != GFN_DIR ||
 		       rbtree_first(&gn->t.d.children) == NULL);
 		if (gn->op.c != NULL && gn->op.c->destroy != NULL)
@@ -243,8 +264,8 @@ void gn_release_nref(struct gitfs_node *gn, unsigned int refcnt)
 		if (gn->backing.gobj != NULL)
 			gobj_release(gn->backing.gobj);
 		fsback_free(&gn->backing.file);
-		if (gn_is_treeroot(gn))
-			gtree_free(gn->tree);
+		gitview_free(gn);
+		assert(gn->saved_node_root == NULL);
 		inum_hash_remove(gn);
 		ogn = gn;
 		gn = gn->parent;
@@ -273,7 +294,7 @@ struct gn_defered_incomplete_lookup {
 /*
  * When we do a lookup and find that we already have a child but it's in
  * the GFN_INCOMPLETE state we must defer this request and retry it after
- * we're done with
+ * GIT gives us some information
  */
 static int defer_incomplete_lookup(struct gitfs_node *parent,
 				   const char *elem)
@@ -360,21 +381,19 @@ void gn_finish_defered_lookups(struct gitfs_node *parent,
 	gn_release(parent);
 }
 
-/*
- * For ->readdir() implementors -- return the inode # of a child or -1
- * if one hasn't been assigned yet
- */
-gitfs_inum_t gn_child_inum(struct gitfs_node *gn, const char *elem)
+/* call api_add_dir_contents() but also provide inode # if it's assigned */
+int gn_add_dir_contents(struct gitfs_node *parent,
+			struct api_readdir_state *rs, const char *elem,
+			enum gitfs_node_type type)
 {
-	gitfs_inum_t result = GITFS_NO_INUM;
+	struct rb_node **rp;
+	gitfs_inum_t inum = GITFS_NO_INUM;
 
-	gn_assert_held(gn);
-	gn = childlist_lookup(gn, elem);
-	if (gn != NULL) {
-		result = gn->inum;
-		gn_release(gn);
-	}
-	return result;
+	gn_assert_held(parent);
+	rp = childlist_walk(parent, elem);
+	if (!RB_IS_NIL(*rp))
+		inum = rbtree_to_named_gn(*rp)->inum;
+	return api_add_dir_contents(rs, elem, type, inum);
 }
 
 int gn_change_name(struct gitfs_node **gnp, const char *newname)
@@ -414,6 +433,24 @@ int gn_change_name(struct gitfs_node **gnp, const char *newname)
 	return 0;
 }
 
+/*
+ * Returns the number of levels down a directory is -- i.e. 0 if "gn" is the
+ * root of our filesystem
+ */
+unsigned int gn_dirlevel(const struct gitfs_node *gn)
+{
+	unsigned int answer = 0;
+
+	for (;;) {
+		assert(gn->type == GFN_DIR);
+		if (gn == &gitfs_node_root)
+			break;
+		gn = gn->parent;
+		answer++;
+	}
+	return answer;
+}
+
 /* IMPLEMENTATION OF "gitfs pwd" COMMAND: */
 
 static int cmd_pwd(UNUSED_ARG(int argn), char * const *argv)
@@ -438,7 +475,7 @@ static int cmd_pwd(UNUSED_ARG(int argn), char * const *argv)
 		    elem[1] == '\0')
 			break;
 		bytebuf_prepend(&bb, elem, strlen(elem));
-	} while (gs_cdup(gsc, 0) == 0);
+	} while (gs_cd_up(gsc, 0) == 0);
 	gs_connection_close(gsc);
 	r = bytebuf_asptr(&bb);
 	if (r == NULL) {

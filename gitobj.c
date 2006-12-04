@@ -369,8 +369,8 @@ static int gitobj_open(struct gitfs_node *gn, UNUSED_ARG(unsigned int flags))
 {
 	int ret;
 
-	assert (gn->type == GFN_FILE);
-	assert (gn->backing.gobj->type == GFN_FILE);
+	assert(gn->type == GFN_FILE);
+	assert(gn->backing.gobj->type == GFN_FILE);
 	gn->backing.gobj->open_count++;
 	ret = gobj_openread_or_defer(gn, NULL, NULL, NULL, 0, 0);
 	/*
@@ -385,16 +385,16 @@ static int gitobj_open(struct gitfs_node *gn, UNUSED_ARG(unsigned int flags))
 static int gitobj_pread(struct gitfs_node *gn,
 			void *buf, size_t size, off_t offset)
 {
-	assert (gn->type == GFN_FILE);
-	assert (gn->backing.gobj->type == GFN_FILE);
+	assert(gn->type == GFN_FILE);
+	assert(gn->backing.gobj->type == GFN_FILE);
 	return gobj_openread_or_defer(gn, NULL, gobj_finish_pread,
-				     buf, size, offset);
+				      buf, size, offset);
 }
 
 static void gitobj_close(struct gitfs_node *gn)
 {
-	assert (gn->type == GFN_FILE);
-	assert (gn->backing.gobj->type == GFN_FILE);
+	assert(gn->type == GFN_FILE);
+	assert(gn->backing.gobj->type == GFN_FILE);
 	gobj_close_file(gn->backing.gobj);
 }
 
@@ -402,8 +402,8 @@ static int gitobj_readlink(struct gitfs_node *gn, char *result, size_t *rlen)
 {
 	int ret;
 
-	assert (gn->type == GFN_SYMLINK);
-	assert (gn->backing.gobj->type == GFN_FILE);
+	assert(gn->type == GFN_SYMLINK);
+	assert(gn->backing.gobj->type == GFN_FILE);
 	gn->backing.gobj->open_count++;
 	ret = gobj_openread_or_defer(gn, NULL, gobj_finish_readlink,
 				     result, *rlen, 0);
@@ -434,10 +434,16 @@ static int gitobj_lookup(struct gitfs_node *parent,
 			 struct gitfs_node **resultp, const char *name)
 {
 	const struct gitdir_entry *e;
+	int rv;
 
-	assert (parent->type == GFN_DIR);
-	assert (parent->backing.gobj->type == GFN_DIR);
+	assert(parent->type == GFN_DIR);
+	assert(parent->backing.gobj->type == GFN_DIR);
 	timespec(&parent->stat.atime);
+	rv = gitview_lookup(parent, resultp, name);
+	if (unlikely(rv != -ENOTTY)) {
+		assert(rv <= 0);
+		return rv;
+	}
 	e = gitdir_find(&parent->backing.gobj->d.dir, name,
 			&parent->t.d.last_lookup_offset);
 	if (e == NULL)
@@ -452,8 +458,9 @@ static int gitobj_lookup(struct gitfs_node *parent,
 static int gitobj_readdir(struct gitfs_node *gn,
 			  struct api_readdir_state *ars)
 {
-	assert (gn->type == GFN_DIR);
-	assert (gn->backing.gobj->type == GFN_DIR);
+	assert(gn->type == GFN_DIR);
+	assert(gn->backing.gobj->type == GFN_DIR);
+	gitview_readdir(gn, ars);
 	gitdir_readdir(&gn->backing.gobj->d.dir, gn, ars);
 	timespec(&gn->stat.atime);
 	return 0;
@@ -461,8 +468,8 @@ static int gitobj_readdir(struct gitfs_node *gn,
 
 static unsigned int gitobj_count_subdirs(struct gitfs_node *gn)
 {
-	assert (gn->type == GFN_DIR);
-	assert (gn->backing.gobj->type == GFN_DIR);
+	assert(gn->type == GFN_DIR);
+	assert(gn->backing.gobj->type == GFN_DIR);
 	return gn->backing.gobj->d.dir.nsubdirs;
 }
 
@@ -497,17 +504,21 @@ static inline int gitptr_match(const struct gitobj_ptr *treeptr,
 			       const struct gitobj_ptr *ourptr,
 			       struct rb_node ***rpp)
 {
-	long diff = gitptr2ulong(treeptr) - gitptr2ulong(ourptr);
+	unsigned long a = gitptr2ulong(treeptr);
+	unsigned long b = gitptr2ulong(ourptr);
 
-	if (diff == 0) {
-		diff = memcmp(&treeptr->sha1[sizeof(unsigned long)],
-			      &ourptr->sha1[sizeof(unsigned long)],
-			      sizeof(ourptr->sha1) - sizeof(unsigned long));
-		if (likely(diff == 0))
+	if (a == b) {
+		int d = memcmp(&treeptr->sha1[sizeof(unsigned long)],
+			       &ourptr->sha1[sizeof(unsigned long)],
+			       sizeof(ourptr->sha1) - sizeof(unsigned long));
+		if (likely(d == 0))
 			return 1;
-	}
-	if (diff < 0)
+		if (d < 0)
+			goto inc_ptr;
+	} else if (a < b) {
+	    inc_ptr:
 		(*rpp)++;
+	}
 	return 0;
 }
 
@@ -544,7 +555,6 @@ void gobj_release(struct gitobj *gobj)
 	assert(gobj->hold_count != 0);
 	if (--gobj->hold_count != 0)
 		return;			/* object still held */
-	assert(gobj->open_count == 0);
 	switch (gobj->type) {
 	case GFN_DIR:
 		gitdir_free(&gobj->d.dir);
@@ -722,14 +732,12 @@ static int fill_gitobj_from_worker_result(struct gitobj *gobj,
 		assert(cmd->answer.open.buf != NULL);
 		ret = gitdir_parse(&gobj->d.dir, cmd->answer.open.buf,
 				   cmd->answer.open.size);
-		if (unlikely(ret != 0)) {
-			assert(ret < 0);
-			break;
-		}
+		assert(ret <= 0);
 		/*
 		 * NOTE: we don't free(cmd->answer.open.buf) here since the
 		 * directory takes ownership of it as ->d.dir.backing_file;
-		 * it's free()'d when the object is destroyed
+		 * it's free()'d when the object is destroyed.  gitdir_parse()
+		 * will free the buffer even if it returns an error
 		 */
 		goto done_nofree;
 	case GFN_FILE:

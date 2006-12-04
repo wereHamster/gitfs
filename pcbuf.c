@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -214,7 +214,7 @@ void pcbuf_vfmt(struct pcbuf *pc, const char *fmt, va_list ap)
 	while (*fmt != '\0' && *fmt != '%')
 		fmt++;
 	if (sfmt != fmt)
-		pcbuf_write(pc, sfmt, sfmt - fmt);
+		pcbuf_write(pc, sfmt, (size_t) (sfmt - fmt));
 	if (*fmt == '\0')
 		return;
 	assert(*fmt == '%');
@@ -330,7 +330,7 @@ void pcbuf_vfmt(struct pcbuf *pc, const char *fmt, va_list ap)
 		goto next_fmt;
 	case '-':
 		assert(fspec.width == 0);
-	   set_prewidth:
+	    set_prewidth:
 		assert(fspec.prewidth == ' ');
 		fspec.prewidth = *fmt;
 		goto next_fmt;
@@ -388,7 +388,8 @@ int pcbuf_fromfd(struct pcbuf *pc, int fd)
 		if (wptr == NULL)
 			return consume_fd(fd);
 	    again:
-		res = read(fd, wptr, pc->active.tail->bufend - wptr);
+		res = read(fd, wptr,
+			   (size_t) (pc->active.tail->bufend - wptr));
 		if (res <= 0) {
 			if (res == 0)
 				return -ECHILD;	/* errno abuse */
@@ -508,7 +509,7 @@ int pcbuf_tofd(struct pcbuf *pc, int fd)
 		if (pe == NULL)
 			break;
 	    again:
-		res = write(fd, pe->rptr, pe->wptr - pe->rptr);
+		res = write(fd, pe->rptr, (size_t) (pe->wptr - pe->rptr));
 		if (res <= 0) {
 			res = (res == 0) ? -ENOSPC : neg_errno();
 			assert(res < 0);

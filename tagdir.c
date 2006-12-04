@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -42,21 +42,49 @@ static void tag_destroy(struct gitfs_node *gn)
 	free(gn->priv.gt);
 }
 
+#define NEEDS_ESCAPING(c) (((c) == ':' || (c) == '\\'))
+
+static size_t strlen_w_escaping(const char *s)
+{
+	size_t result;
+
+	for (result = 0; *s != '\0'; s++)
+		result += NEEDS_ESCAPING(*s) ? 2 : 1;
+	return result;
+}
+
 static size_t tag_link_len(struct gitfs_node *gn)
 {
 	struct git_tag *gt = gn->priv.gt;
+	size_t result;
 
 	assert(gn->type == GFN_SYMLINK);
 	assert(gt != NULL);
+	result = (gt->levels_back * strlen_const("../")) + HEX_PTR_LEN;
+	do {
+		result += 1 + strlen_w_escaping(gn->name);
+		gn = gn->parent;
+	} while (gn != &gitfs_node_root);
+	return result;
+}
 
-	return (gt->levels_back * strlen_const("../")) + HEX_PTR_LEN;
+static void add_escaped_name(char **p, const struct gitfs_node *gn)
+{
+	const char *n;
+
+	if (gn == &gitfs_node_root)
+		return;
+	add_escaped_name(p, gn->parent);
+	for (n = gn->name; *n != '\0'; n++) {
+		if (NEEDS_ESCAPING(*n))
+			*(*p)++ = '\\';
+		*(*p)++ = *n;
+	}
+	*(*p)++ = ':';
 }
 
 static int tag_readlink(struct gitfs_node *gn, char *result, size_t *rlen)
 {
-	static const char xd[16] = {
-		'0', '1', '2', '3', '4', '5', '6', '7',
-		'8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
 	struct git_tag *gt = gn->priv.gt;
 	char *p = result;
 	unsigned int i;
@@ -67,13 +95,15 @@ static int tag_readlink(struct gitfs_node *gn, char *result, size_t *rlen)
 	if (*rlen <= tag_link_len(gn))
 		return -ENAMETOOLONG;
 	for (i = 0; i < gt->levels_back; i++) {
-		memcpy(p, "../", strlen_const("../"));
-		p += strlen_const("../");
+		static const char dot_dot_slash[] = { '.', '.', '/' };
+		memcpy(p, dot_dot_slash, sizeof(dot_dot_slash));
+		p += sizeof(dot_dot_slash);
 	}
+	add_escaped_name(&p, gn);
 	b = &gt->obj.sha1[0];
 	for (i = 0; i < sizeof(gt->obj.sha1); i++) {
-		*p++ = xd[(*b >> 4) & 0xF];
-		*p++ = xd[(*b >> 0) & 0xF];
+		*p++ = xdigit_lc[(*b >> 4) & 0xF];
+		*p++ = xdigit_lc[(*b >> 0) & 0xF];
 		b++;
 	}
 	*rlen = p - result;
@@ -195,8 +225,8 @@ static int tagdir_readdir(struct gitfs_node *gn,
 			continue;
 		if (st.st_size > HEX_PTR_LEN + 2)
 			continue;
-		if (api_add_dir_contents(ars, de->d_name, GFN_SYMLINK,
-					 gn_child_inum(gn, de->d_name)) != 0)
+		if (gn_add_dir_contents(gn, ars,
+					de->d_name, GFN_SYMLINK) != 0)
 			break;
 	}
 	if (closedir(dp) != 0)

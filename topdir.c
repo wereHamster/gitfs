@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -43,6 +43,8 @@ static unsigned int topdir_count_subdirs(struct gitfs_node *gn)
 			+ worktree_count_subdirs();
 }
 
+static void topdir_destroy(UNUSED_ARG(struct gitfs_node *gn))
+	 __attribute__ ((noreturn));
 static void topdir_destroy(UNUSED_ARG(struct gitfs_node *gn))
 {
 	/*

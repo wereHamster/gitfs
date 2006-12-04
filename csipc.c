@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -142,14 +142,20 @@ struct csipc_open_file {
 	struct gitfs_saved_node s;
 };
 
+struct csipc_client;
+typedef enum service_result (*csop_service_fn)(struct csipc_client *cli);
+
 struct csipc_client {
 	int sfd;
 	struct rb_tree files;
 	csipc_fh_t next_fh;
 	int last_writeavail;
 	struct pcbuf in, out;
-	enum service_result (*service)(struct csipc_client *cli);
+	csop_service_fn service;
 	union {
+		struct {
+			uint32_t varlen;
+		} conf_fetch;
 	} state;
 	unsigned int client_num;	/* for debugging messages only */
 };
@@ -228,18 +234,20 @@ static void csipc_client_fini(struct csipc_client *cli)
 }
 
 /*
- * Macros with embeded "return" statements are inherently evil, but this one
- * is just too useful to avoid
+ * Macros with embeded "return" statements are inherently evil, but these
+ * are just too useful to avoid.  Sorry.
  */
-#define csipc_fetch_or_return(cli, objp)				\
+#define csipc_get_bytes_or_return(cli, objp, objlen)			\
 do {									\
 	ssize_t for_res;						\
-	assert(cli->in.error == 0);					\
-	if (unlikely(cli->in.cur_size < sizeof(*objp)))			\
-		return SERVICED_OK;	/* no opcode yet */		\
-	for_res = pcbuf_read(&cli->in, (objp), sizeof(*objp));		\
-	assert(for_res == (ssize_t) sizeof(*objp));			\
+	assert((cli)->in.error == 0);					\
+	if (unlikely((cli)->in.cur_size < (objlen)))			\
+		return SERVICED_OK;	/* not enough data yet */	\
+	for_res = pcbuf_read(&(cli)->in, (objp), (objlen));		\
+	assert(for_res == (ssize_t) (objlen));				\
 } while (0)
+#define csipc_fetch_or_return(cli, objp)				\
+		csipc_get_bytes_or_return((cli), (objp), sizeof(*(objp)))
 
 static enum service_result cliserv_getopcode(struct csipc_client *cli);
 
@@ -257,9 +265,12 @@ static enum service_result csop_open_inode(struct csipc_client *cli)
 
 	csipc_fetch_or_return(cli, &inum);
 	gn = gn_lookup_inum(inum);
-	if (gn == NULL)
-		fh = -ENOENT;
-	else {
+	if (gn == NULL) {
+		/* inode 0 isn't on the gnode hash */
+		fh = (inum == 0)
+			? csipc_add_file(cli, &gitfs_node_root)
+			: -ENOENT;
+	} else {
 		fh = csipc_add_file(cli, gn);
 		gn_release(gn);
 	}
@@ -319,7 +330,7 @@ static enum service_result csop_getname(struct csipc_client *cli)
 }
 
 /* In: file handle; Out: nothing */
-static enum service_result csop_cdup(struct csipc_client *cli)
+static enum service_result csop_cd_up(struct csipc_client *cli)
 {
 	csipc_fh_t fh;
 	struct csipc_open_file *of;
@@ -379,7 +390,7 @@ static enum service_result csop_dump_ino_single(struct csipc_client *cli)
 }
 
 /* In: file handle; Out: true or false*/
-static enum service_result csop_is_treeroot(struct csipc_client *cli)
+static enum service_result csop_is_viewroot(struct csipc_client *cli)
 {
 	csipc_fh_t fh;
 	struct gitfs_node *gn;
@@ -388,70 +399,101 @@ static enum service_result csop_is_treeroot(struct csipc_client *cli)
 	csipc_fetch_or_return(cli, &fh);
 	gn = csipc_file(cli, fh);
 	if (gn != NULL)
-		answer = gn_is_treeroot(gn);
+		answer = gn_is_viewroot(gn);
 	pcbuf_write_obj(&cli->out, answer);
 	csipc_client_command_finished(cli);
 	return SERVICED_OK;
 }
 
+/* In: file handle; Out: -error, struct gs_view_info */
+static enum service_result csop_get_view_info(struct csipc_client *cli)
+{
+	csipc_fh_t fh;
+	struct gitfs_node *gn;
+	int32_t error;
+
+	csipc_fetch_or_return(cli, &fh);
+	gn = csipc_file(cli, fh);
+	error = 0;
+	if (gn == NULL)
+		error = -EBADF;
+	else if (gn->view == NULL)
+		error = -ENODEV;
+	pcbuf_write_obj(&cli->out, error);
+	if (error == 0)
+		gitview_get_info(&cli->out, gn->view);
+	csipc_client_command_finished(cli);
+	return SERVICED_OK;
+}
+
+static enum service_result cliserv_conf_fetch_pt2(struct csipc_client *cli)
+{
+	char var[cli->state.conf_fetch.varlen + 1];
+
+	csipc_get_bytes_or_return(cli, var, cli->state.conf_fetch.varlen);
+	var[cli->state.conf_fetch.varlen] = '\0';
+	conf_answer_client_query(&cli->out, var);
+	csipc_client_command_finished(cli);
+	return SERVICED_OK;
+}
+
+static enum service_result csop_conf_fetch(struct csipc_client *cli)
+{
+	csipc_fetch_or_return(cli, &cli->state.conf_fetch.varlen);
+	/*
+	 * OK, we've read the length and stashed it in our state.  Since
+	 * the rest might not be available yet we have to do the rest in
+	 * its own handler function
+	 */
+	cli->service = cliserv_conf_fetch_pt2;
+	return SERVICED_OK;
+}
+
 typedef uint32_t csipc_opcode_t;
-#define CSOP_NOOP		(0)
-#define CSOP_OPEN_INODE		(1)
-#define CSOP_CLOSE		(2)
-#define CSOP_DUPFD		(3)
-#define CSOP_GETNAME		(4)
-#define CSOP_CDUP		(5)
-#define CSOP_DUMP_GOBJ		(6)
-#define	CSOP_GLS		(7)
-#define	CSOP_DUMP_INO		(8)
-#define	CSOP_DUMP_INO_SINGLE	(9)
-#define CSOP_IS_TREEROOT	(10)
+#define CSOP_OPEN_INODE		(0)
+#define CSOP_CLOSE		(1)
+#define CSOP_DUPFD		(2)
+#define CSOP_GETNAME		(3)
+#define CSOP_CD_UP		(4)
+#define CSOP_DUMP_GOBJ		(5)
+#define CSOP_GLS		(6)
+#define CSOP_DUMP_INO		(7)
+#define CSOP_DUMP_INO_SINGLE	(8)
+#define CSOP_IS_VIEWROOT	(9)
+#define CSOP_GET_VIEW_INFO	(10)
+#define CSOP_CONF_FETCH		(11)
 
 static enum service_result cliserv_getopcode(struct csipc_client *cli)
 {
+	static const csop_service_fn services[] = {
+		[CSOP_OPEN_INODE] = csop_open_inode,
+		[CSOP_CLOSE] = csop_close,
+		[CSOP_DUPFD] = csop_dupfd,
+		[CSOP_GETNAME] = csop_getname,
+		[CSOP_CD_UP] = csop_cd_up,
+		[CSOP_DUMP_GOBJ] = csop_dump_gobj,
+		[CSOP_GLS] = csop_gls,
+		[CSOP_DUMP_INO] = csop_dump_ino,
+		[CSOP_DUMP_INO_SINGLE] = csop_dump_ino_single,
+		[CSOP_IS_VIEWROOT] = csop_is_viewroot,
+		[CSOP_GET_VIEW_INFO] = csop_get_view_info,
+		[CSOP_CONF_FETCH] = csop_conf_fetch,
+	};
 	csipc_opcode_t opcode;
 
 	csipc_fetch_or_return(cli, &opcode);
 	gdbg("CSIPC: client %u opcode %u",
 	     cli->client_num, (unsigned int) opcode);
-	switch (opcode) {
-	case CSOP_NOOP:
-		break;
-	case CSOP_OPEN_INODE:
-		cli->service = csop_open_inode;
-		break;
-	case CSOP_CLOSE:
-		cli->service = csop_close;
-		break;
-	case CSOP_DUPFD:
-		cli->service = csop_dupfd;
-		break;
-	case CSOP_GETNAME:
-		cli->service = csop_getname;
-		break;
-	case CSOP_CDUP:
-		cli->service = csop_cdup;
-		break;
-	case CSOP_DUMP_GOBJ:
-		cli->service = csop_dump_gobj;
-		break;
-	case CSOP_GLS:
-		cli->service = csop_gls;
-		break;
-	case CSOP_DUMP_INO:
-		cli->service = csop_dump_ino;
-		break;
-	case CSOP_DUMP_INO_SINGLE:
-		cli->service = csop_dump_ino_single;
-		break;
-	case CSOP_IS_TREEROOT:
-		cli->service = csop_is_treeroot;
-		break;
-	default:
+	if (unlikely(opcode >= (sizeof(services) / sizeof(services[0])))) {
+	    bad_opcode:
 		gdbg("CSIPC: client %u sent unknown opcode %u",
-		    cli->client_num,
-				(unsigned int) opcode);
+		    cli->client_num, (unsigned int) opcode);
 		return SERVICED_ERROR;
+	}
+	cli->service = services[opcode];
+	if (cli->service == NULL) {
+		csipc_client_command_finished(cli);
+		goto bad_opcode;
 	}
 	return SERVICED_OK;
 }
@@ -589,7 +631,7 @@ static int gs_wait(const struct gitfs_server_connection *gsc,
 
 	pfd.fd = gsc->fd;
 	pfd.events = (short) wtype;
-	if (poll(&pfd, 1, 0) < 0 && errno != EINTR) {
+	if (poll(&pfd, 1, -1) < 0 && errno != EINTR) {
 		perror("CSIPC: poll");
 		return -1;
 	}
@@ -635,7 +677,7 @@ static int gs_read(struct gitfs_server_connection *gsc,
 			end = &gsc->rbuf[sizeof(gsc->rbuf)];
 	    again:
 		assert(end > start);
-		rv = read(gsc->fd, start, end - start);
+		rv = read(gsc->fd, start, (size_t) (end - start));
 		if (rv <= 0) {
 			if (rv == 0) {
 				fprintf(stderr, "CSIPC: EOF while reading\n");
@@ -877,14 +919,14 @@ int gs_getname(struct gitfs_server_connection *gsc, csipc_fh_t fh,
 	return res;
 }
 
-int gs_cdup(const struct gitfs_server_connection *gsc, csipc_fh_t fh)
+int gs_cd_up(const struct gitfs_server_connection *gsc, csipc_fh_t fh)
 {
 	struct {
 		csipc_opcode_t opcode;
 		csipc_fh_t fh;
 	} cmd;
 
-	cmd.opcode = CSOP_CDUP;
+	cmd.opcode = CSOP_CD_UP;
 	cmd.fh = fh;
 	return gs_write(gsc, &cmd, sizeof(cmd));
 }
@@ -1018,17 +1060,62 @@ int gs_dump_ino(struct gitfs_server_connection *gsc, void *buf, size_t buflen,
 	return (sres == SERVICED_EOF) ? 0 : -1;
 }
 
-int gs_is_treeroot(struct gitfs_server_connection *gsc, csipc_fh_t fh)
+int gs_is_viewroot(struct gitfs_server_connection *gsc, csipc_fh_t fh)
 {
 	struct {
 		csipc_opcode_t opcode;
 		csipc_fh_t fh;
 	} cmd;
-	int reply;
+	int32_t reply;
 
-	cmd.opcode = CSOP_IS_TREEROOT;
+	cmd.opcode = CSOP_IS_VIEWROOT;
 	cmd.fh = fh;
 	if (gs_cmd_resp(gsc, &cmd, sizeof(cmd), &reply, sizeof(reply)) != 0)
 		reply = -EIO;
 	return reply;
+}
+
+int gs_get_view_info(struct gitfs_server_connection *gsc, csipc_fh_t fh,
+		     struct gs_view_info *vinfo, size_t reslen)
+{
+	struct {
+		csipc_opcode_t opcode;
+		csipc_fh_t fh;
+	} cmd;
+	int32_t error;
+
+	if (reslen < sizeof(*vinfo))
+		return -E2BIG;
+	cmd.opcode = CSOP_GET_VIEW_INFO;
+	cmd.fh = fh;
+	if (gs_cmd_resp(gsc, &cmd, sizeof(cmd), &error, sizeof(error)) != 0)
+		return -EIO;
+	if (error != 0) {
+		assert(error < 0);
+		return error;
+	}
+	if (gs_read(gsc, vinfo, sizeof(*vinfo)) != 0)
+		return -EIO;
+	return gs_read_tonul(gsc, vinfo->symbolic_name,
+			     reslen - sizeof(*vinfo));
+}
+
+int gs_conf_raw_fetch(struct gitfs_server_connection *gsc, const char *var,
+		      char *result, size_t reslen)
+{
+	struct {
+		csipc_opcode_t opcode;
+		uint32_t varlen;
+		/* followed by variable name, not '\0'-terminated */
+	} cmd;
+	uint32_t found;
+
+	cmd.opcode = CSOP_CONF_FETCH;
+	cmd.varlen = strlen(var);
+	if (gs_write(gsc, &cmd, sizeof(cmd)) != 0 ||
+	    gs_cmd_resp(gsc, var, cmd.varlen, &found, sizeof(found)) != 0)
+		return -EIO;
+	if (found == 0)
+		return -ENOENT;
+	return gs_read_tonul(gsc, result, reslen);
 }

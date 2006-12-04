@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -189,20 +189,20 @@ static void rotate(struct rb_node *node, enum rb_dir dir)
 	*(node->priv.plink = childp_dir(oldchild, dir)) = node;
 }
 
-/* Inserts new node at location given by "link" and rebalances tree */
-void rbtree_insert(struct rb_node **link, struct rb_node *node)
+/* Inserts new node at location given by "linkp" and rebalances tree */
+void rbtree_insert(struct rb_node **linkp, struct rb_node *node)
 {
 	struct rb_node *pnode;
 
-	assert_node_ok(childptr_to_node(link));
+	assert_node_ok(childptr_to_node(linkp));
 	assert(node != NULL);
 	assert(!RB_IS_NIL(node));
-	assert(RB_IS_NIL(*link));
+	assert(RB_IS_NIL(*linkp));
 
 	/* Do normal insert here */
-	*link = node;
+	*linkp = node;
 	node->child[0] = node->child[1] = RBNIL;
-	node->priv.plink = link;
+	node->priv.plink = linkp;
 	set_red(node);
 
 	/* Now the tricky part - rebalancing the tree around "node" */
@@ -256,10 +256,10 @@ void rbtree_insert(struct rb_node **link, struct rb_node *node)
 }
 
 /* link parent's "dir" child to "child" node */
-static inline void rb_make_link(struct rb_node *parent, enum rb_dir dir,
+static inline void rb_make_link(struct rb_node *parentnode, enum rb_dir dir,
 				struct rb_node *child)
 {
-	struct rb_node **cp = childp_dir(parent, dir);
+	struct rb_node **cp = childp_dir(parentnode, dir);
 
 	if (!RB_IS_NIL(child))
 		child->priv.plink = cp;
@@ -540,7 +540,7 @@ static void rbtree_full_check(struct rb_tree *tree, unsigned int size)
 		saw_errors++;
 	}
 	if (mm.total != size) {
-	   size_error:
+	    size_error:
 		fprintf(stderr, "expected %u items in tree, saw %u\n",
 			size, mm.total);
 		saw_errors++;
@@ -599,20 +599,20 @@ static unsigned int items_in_tree = 0;
 
 static void rbtest_insert(struct rb_test *rt)
 {
-	struct rb_node **link;
+	struct rb_node **linkp;
 
 	assert(rt->in_tree == 0);
-	rbtree_walk(&test_tree, link) {
-		unsigned long pval = rbtest_nodeval(*link);
+	rbtree_walk(&test_tree, linkp) {
+		unsigned long pval = rbtest_nodeval(*linkp);
 		if (pval == rt->val) {
 			fprintf(stderr, "insert failed: val %lu already "
 				"found at node %p (testdata = %p)\n",
-				pval, *link, rt);
+				pval, *linkp, rt);
 			abort();
 		}
-		link = &(*link)->child[(rt->val < pval) ? 0 : 1];
+		linkp = &(*linkp)->child[(rt->val < pval) ? 0 : 1];
 	}
-	rbtree_insert(link, &rt->rb);
+	rbtree_insert(linkp, &rt->rb);
 	assert(RB_IS_NIL(test_tree.aroot.child[1]));
 	rt->in_tree = 1;
 	items_in_tree++;
@@ -654,7 +654,7 @@ int main(int argn, char **argv)
 		return 8;
 	}
 	rbtest_setup(atoi(argv[1]));
-	srandom(getpid() ^ time(NULL));
+	srandom((unsigned int) (getpid() ^ time(NULL)));
 	/* Phase 1: insert half the elements into the array */
 	fprintf(stderr, "Phase 1...\n");
 	for (i = 0; i < test_size; i++)

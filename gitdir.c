@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -16,7 +16,9 @@
 void gitdir_free(struct gitdir *gdir)
 {
 	free(gdir->entries);
+	gdir->entries = NULL;
 	free(gdir->backing_buf);
+	gdir->backing_buf = NULL;
 }
 
 /*
@@ -141,9 +143,9 @@ int gitdir_parse(struct gitdir *gdir, unsigned char *data, size_t datalen)
 			gdir->nsubdirs++;
 		/*
 		 * We do binary searches on the table so the names must be
-		 * sorted.  As far as I can tell git directories always are
-		 * so this is just a redundant check, but for now I want to
-		 * be safe
+		 * sorted.  The git code generally does this for us but
+		 * it seems to use a slightly non-strcmp()-compatible order
+		 * when one string is a substring of the other
 		 */
 		if (out_of_order <= 0) {
 			out_of_order = strcmp(last_parsed_name, ent->name);
@@ -151,7 +153,7 @@ int gitdir_parse(struct gitdir *gdir, unsigned char *data, size_t datalen)
 		}
 	}
 	assert(gdir->nsubdirs <= gdir->nentries);
-	if (out_of_order != 0)
+	if (unlikely(out_of_order > 0))
 		qsort(gdir->entries, gdir->nentries, sizeof(gdir->entries[0]),
 		      gitdir_entry_compare);
 	return 0;
@@ -218,16 +220,15 @@ struct gitdir_entry *gitdir_find(struct gitdir *gdir, const char *name,
 	return NULL;
 }
 
-void gitdir_readdir(struct gitdir *gdir, struct gitfs_node *gn,
+void gitdir_readdir(const struct gitdir *gdir, struct gitfs_node *gn,
 		    struct api_readdir_state *ars)
 {
 	unsigned int i;
 
 	assert(gdir != NULL);
 	for (i = 0; i < gdir->nentries; i++) {
-		struct gitdir_entry *e = &gdir->entries[i];
-		if (api_add_dir_contents(ars, e->name, e->type,
-					 gn_child_inum(gn, e->name)) != 0)
+		const struct gitdir_entry *e = &gdir->entries[i];
+		if (gn_add_dir_contents(gn, ars, e->name, e->type) != 0)
 			break;
 	}
 }

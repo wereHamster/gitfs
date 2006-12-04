@@ -14,7 +14,7 @@ Prerequisites:
 
   * GIT  --  http://www.kernel.org/pub/software/scm/git/
 
-    Currently tested with git-core-0.99.8.  Since we link against libgit.a
+    Currently tested with git-1-4.4.  Since we link against libgit.a
     you'll need to have the compiled source tree sitting around to build gitfs.
 
 Next, edit the first few lines of Makefile to suit:

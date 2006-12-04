@@ -1,6 +1,6 @@
 /*
  *  GITFS: Filesystem view of a GIT repository
- *  Copyright (C) 2005  Mitchell Blank Jr <mitch@sfgoth.com>
+ *  Copyright (C) 2005-2006  Mitchell Blank Jr <mitch@sfgoth.com>
  *
  *  This program can be distributed under the terms of the GNU GPL.
  *  See the file COPYING.
@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <limits.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -27,6 +28,8 @@
  * against <linux/fuse.h> for the ABI definitions
  */
 #include FUSE_HEADER
+
+#define GITFS_MAX_FUSE_WRITE	(4096)
 
 static const char fusermount[] = "fusermount";
 static const char fusermount_error[] =
@@ -41,7 +44,13 @@ int api_umount_and_exit(const char *path)
 	return 8;
 }
 
-static int fuse_fd;
+#ifndef POLLWRNORM
+#  define POLLWRNORM (0)
+#endif /* !POLLWRNORM */
+static struct pollfd fuse_poll_write = {
+	.events = POLLOUT | POLLWRNORM,
+};
+#define fuse_fd		(fuse_poll_write.fd)
 static const char *fuse_mountpoint;
 
 static void close_lowfd(void)
@@ -77,13 +86,13 @@ void api_umount(void)
 	(void) waitpid(child, NULL, 0);
 }
 
-static void exec_mount_helper(const char *path, int socket, int rdonly)
+static void exec_mount_helper(const char *path, int socketfd, int rdonly)
 {
 	char fd_str[10];
 	const char *opts = "ro,fsname=gitfs";
 
-	fcntl(socket, F_SETFD, 0);
-	snprintf(fd_str, sizeof(fd_str), "%d", socket);
+	fcntl(socketfd, F_SETFD, 0);
+	snprintf(fd_str, sizeof(fd_str), "%d", socketfd);
 	if (setenv("_FUSE_COMMFD", fd_str, 1) != 0) {
 		errno = ENOMEM;
 		perror("setenv");
@@ -96,7 +105,7 @@ static void exec_mount_helper(const char *path, int socket, int rdonly)
 	fputs(fusermount_error, stderr);
 }
 
-static int receive_fuse_devfd(int socket)
+static int receive_fuse_devfd(int socketfd)
 {
 	struct msghdr msg;
 	struct iovec iov;
@@ -113,7 +122,7 @@ static int receive_fuse_devfd(int socket)
 	msg.msg_control = ccmsg;
 	msg.msg_controllen = sizeof(ccmsg);
 	for (;;) {
-		int rv = recvmsg(socket, &msg, 0);
+		int rv = recvmsg(socketfd, &msg, 0);
 		if (rv > 0)
 			break;
 		if (rv == 0) {
@@ -146,7 +155,8 @@ struct fuse_out {
 		struct fuse_write_out write;
 		struct fuse_statfs_out statfs;
 		struct fuse_getxattr_out getxattr;
-		struct fuse_init_in_out init;
+		struct fuse_init_out init;
+		struct fuse_lk_out lock;
 		char read[0];
 	} arg;
 };
@@ -168,6 +178,11 @@ struct api_request {
 	 */
 	int (*complete)(int error);
 	struct gitfs_saved_node sn;
+	/*
+	 * If the kernel indicates that a succesful operation was interrupted
+	 * we are responsible for unwinding it
+	 */
+	void (*rollback)(void);
 	/*
 	 * Values that need to be preserved across save/complete for specific
 	 * operations
@@ -290,7 +305,7 @@ struct fuse_in {
 			char name[0];
 		} link;
 		struct fuse_setattr_in setattr;
-		struct fuse_open_in open;
+		struct fuse_open_in open;	/* _OPEN and _CREATE */
 		struct fuse_release_in release;
 		struct fuse_flush_in flush;
 		struct fuse_read_in read;
@@ -302,12 +317,19 @@ struct fuse_in {
 		struct {
 			struct fuse_setxattr_in chdr;
 			char name[0];
+			/*
+			 * after '\0'-terminated name, the attribute to set
+			 * is sent.  It's length is given in chdr.size
+			 */
 		} setxattr;
 		struct {
 			struct fuse_getxattr_in chdr;
 			char name[0];
 		} getxattr;
-		struct fuse_init_in_out init;
+		struct fuse_init_in init;
+		struct fuse_lk_in lock;
+		struct fuse_access_in access;
+		struct fuse_interrupt_in interrupt;
 		/*
 		 * lookup, unlink, rmdir, and removexattr just take a
 		 * string; no per-command header.  symlink takes two
@@ -317,9 +339,6 @@ struct fuse_in {
 		char name[0];
 	} arg;
 };
-
-#define ENTRY_REVALIDATE_TIME	(1) /* sec */
-#define ATTR_REVALIDATE_TIME	(1) /* sec */
 
 static inline struct gitfs_node *find_nodeid(const struct fuse_in *in)
 {
@@ -421,6 +440,9 @@ static int lookup_stat_complete(int error)
 	return error;
 }
 
+#define ENTRY_REVALIDATE_TIME	(1) /* sec */
+#define ATTR_REVALIDATE_TIME	(1) /* sec */
+
 static int lookup_complete(int error)
 {
 	if (error == 0) {
@@ -461,6 +483,15 @@ static int fuse_lookup(const struct fuse_in *in)
 	else
 		res = lookup_complete(res);
 	return res;
+}
+
+/*
+ * ->rollback() handler for things which return a held reference to a fuse
+ * node (LOOKUP, MKNOD, MKDIR, SYMLINK, LINK)
+ */
+static void hold_rollback(void)
+{
+	gn_release(cur_req->sn.gn);
 }
 
 static void fuse_forget(__u64 nodeid, __u64 refcnt)
@@ -545,12 +576,13 @@ static int fuse_readlink(const struct fuse_in *in)
 	int res = find_nodeid_type(in, &cur_req->sn.gn, GFN_SYMLINK);
 
 	if (res == 0) {
-		static char link[PATH_MAX + 1];
-		cur_req->iov[1].iov_base = link;
-		cur_req->iov[1].iov_len = sizeof(link);
+		static char linkval[PATH_MAX + 1];
+		cur_req->iov[1].iov_base = linkval;
+		cur_req->iov[1].iov_len = sizeof(linkval);
 		res = cur_req->sn.gn->op.sl->readlink(cur_req->sn.gn,
-					   link, &cur_req->iov[1].iov_len);
-		assert(res != 0 || cur_req->iov[1].iov_len <= sizeof(link));
+					   linkval, &cur_req->iov[1].iov_len);
+		assert(res != 0 ||
+		       cur_req->iov[1].iov_len <= sizeof(linkval));
 		gn_release(cur_req->sn.gn);
 		if (request_was_saved())
 			cur_req->complete = empty_complete;
@@ -597,6 +629,13 @@ static int fuse_open(const struct fuse_in *in)
 	return res;
 }
 
+static void open_cleanup(void)
+{
+	assert(cur_req->sn.gn->open_count > 0);
+	cur_req->sn.gn->open_count--;
+	gn_release(cur_req->sn.gn);
+}
+
 static inline struct gitfs_node *fh_to_gnode(__u64 fh)
 {
 	assert(fh != 0);
@@ -609,9 +648,7 @@ static void fuse_release(const struct fuse_in *in)
 	assert(cur_req->sn.gn->type == GFN_FILE);
 	if (cur_req->sn.gn->op.f->close != NULL)
 		cur_req->sn.gn->op.f->close(cur_req->sn.gn);
-	assert(cur_req->sn.gn->open_count > 0);
-	cur_req->sn.gn->open_count--;
-	gn_release(cur_req->sn.gn);
+	open_cleanup();
 }
 
 static int fuse_read(const struct fuse_in *in)
@@ -619,7 +656,10 @@ static int fuse_read(const struct fuse_in *in)
 	static char *read_buf = NULL;
 	static size_t read_buf_len = 0;
 	int res;
+	off_t offset = in->arg.read.offset;
 
+	if (offset < 0)
+		return -EINVAL;
 	cur_req->sn.gn = fh_to_gnode(in->arg.read.fh);
 	assert(cur_req->sn.gn->type == GFN_FILE);
 	assert(cur_req->sn.gn->op.f->pread != NULL);
@@ -636,7 +676,7 @@ static int fuse_read(const struct fuse_in *in)
 	 * reused for the next op
 	 */
 	res = cur_req->sn.gn->op.f->pread(cur_req->sn.gn, read_buf,
-			      in->arg.read.size, in->arg.read.offset);
+			      in->arg.read.size, offset);
 	cur_req->iov[1].iov_base = read_buf;
 	cur_req->iov[1].iov_len = res;
 	if (request_was_saved())
@@ -692,6 +732,21 @@ static int fuse_opendir(const struct fuse_in *in)
 	return 0;
 }
 
+static void destroy_readdir_state(struct api_readdir_state *rs)
+{
+	assert(rs->gn->open_count > 0);
+	rs->gn->open_count--;
+	gn_release(rs->gn);
+	free(rs->buf);
+	free(rs);
+}
+
+static void opendir_rollback(void)
+{
+	destroy_readdir_state((struct api_readdir_state *)
+				(unsigned long) cur_req->out.arg.open.fh);
+}
+
 static inline __u32 git_type_to_dirent(enum gitfs_node_type gt)
 {
 	switch (gt) {
@@ -737,7 +792,7 @@ int api_add_dir_contents(struct api_readdir_state *rs, const char *name,
 	assert(rs->buf_left >= desize);
 	assert(&rs->bufend[-rs->buf_left] >= rs->buf);
 	de = (struct fuse_dirent *) &rs->bufend[-rs->buf_left];
-	de->ino = (inum == 0) ? FUSE_ROOT_ID : inum & 0xFFFFFFFF;
+	de->ino = (inum == 0) ? FUSE_ROOT_ID : (inum & 0xFFFFFFFF);
 	de->off = desize + (((unsigned char *) de) - rs->buf);
 	de->namelen = namelen;
 	de->type = git_type_to_dirent(type);
@@ -814,13 +869,50 @@ static int fuse_readdir(const struct fuse_in *in)
 
 static void fuse_releasedir(const struct fuse_in *in)
 {
-	struct api_readdir_state *rs = fh_to_readdir(in->arg.release.fh);
+	destroy_readdir_state(fh_to_readdir(in->arg.release.fh));
+}
 
-	assert(rs->gn->open_count > 0);
-	rs->gn->open_count--;
-	gn_release(rs->gn);
-	free(rs->buf);
-	free(rs);
+static void empty_rollback(void)
+{
+	/* nothing */
+}
+
+/* returns non-zero if we shouldn't retry the write */
+static int fuse_handle_write_error(void)
+{
+	switch (errno) {
+	case EAGAIN:
+		/*
+		 * I don't believe this actually can happen to a fuse device,
+		 * but just for safety we'll wait for writability here
+		 */
+		gdbg("   WAITING FOR WRITABILITY");
+		if (poll(&fuse_poll_write, 1, -1) < 0)
+			switch (errno) {
+			case EAGAIN:
+			case EINTR:
+				break;
+			default:
+				perror("polling fuse device for writability");
+				return 1;
+			}
+		/* FALLTHROUGH */
+	case EINTR:		/* just retry */
+		return 0;
+	case ENOENT:		/* the tricky one */
+		/*
+		 * if a write to a fuse device returns ENOENT this indicates
+		 * that the filesystem request was interrupted and we may
+		 * need to rollback
+		 */
+		gdbg("   CANCELLED %llu", cur_req->out.hdr.unique);
+		if (cur_req->out.hdr.error == 0)
+			cur_req->rollback();
+		break;
+	default:		/* not much we can do */
+		perror("writing fuse device");
+	}
+	return 1;
 }
 
 /*
@@ -847,13 +939,28 @@ static void fuse_request_reply_or_save(void)
 		assert(cur_req->iov[0].iov_base == &cur_req->out);
 		cur_req->iov[0].iov_len = cur_req->out.hdr.len;
 		cur_req->out.hdr.len += cur_req->iov[1].iov_len;
-		if (writev(fuse_fd, cur_req->iov, 2) < 0)
-			goto write_error;
+		for (;;) {
+			ssize_t s = writev(fuse_fd, cur_req->iov, 2);
+			if (s >= 0) {
+				assert(((size_t) s) ==
+				       (cur_req->iov[0].iov_len +
+					cur_req->iov[1].iov_len));
+				break;
+			}
+			if (fuse_handle_write_error())
+				break;
+		}
 		return;
 	}
-	if (write(fuse_fd, &cur_req->out, cur_req->out.hdr.len) < 0) {
-	    write_error:
-		perror("writing fuse device");
+	for (;;) {
+		ssize_t s = write(fuse_fd, &cur_req->out,
+				  cur_req->out.hdr.len);
+		if (s >= 0) {
+			assert(((size_t) s) == cur_req->out.hdr.len);
+			break;
+		}
+		if (fuse_handle_write_error())
+			break;
 	}
 }
 
@@ -958,6 +1065,7 @@ static enum service_result look_for_init_cmd(const struct fuse_in *in,
 	reply.hdr.error = 0;
 	reply.arg.init.major = FUSE_KERNEL_VERSION;
 	reply.arg.init.minor = FUSE_KERNEL_MINOR_VERSION;
+	reply.arg.init.max_write = GITFS_MAX_FUSE_WRITE;
 	if (write(fuse_fd, &reply,
 		  sizeof(reply.hdr) + sizeof(reply.arg.init)) < 0) {
 		perror("sending FUSE_INIT reply");
@@ -980,9 +1088,12 @@ enum service_result api_service_poll(void)
 {
 	union {
 		struct fuse_in f;
-		unsigned char storage[FUSE_MAX_IN];
+		unsigned char storage[GITFS_MAX_FUSE_WRITE +
+				sizeof(struct fuse_write_in) +
+				sizeof(struct fuse_in_header)];
+		unsigned char minsize[FUSE_MIN_READ_BUFFER];
 	} in;
-	int rv = read(fuse_fd, in.storage, sizeof(in.storage));
+	int rv = read(fuse_fd, in.storage, sizeof(in));
 
 	if (unlikely(rv < (int) sizeof(in.f.hdr))) {
 		if (rv < 0) {
@@ -1005,6 +1116,7 @@ enum service_result api_service_poll(void)
 	/* Process normal command: */
 	assert(cur_req != NULL);
 	assert(next_cur_req == NULL);
+	cur_req->rollback = empty_rollback;
 	cur_req->iov[1].iov_len = 0;
 	cur_req->out.hdr.unique = in.f.hdr.unique;
 	gdbg("Q: uniq %llu, opcode %u, nodeid=%llu, alen=%u",
@@ -1012,6 +1124,7 @@ enum service_result api_service_poll(void)
 	     rv - sizeof(in.f.hdr));
 	switch (in.f.hdr.opcode) {
 	case FUSE_LOOKUP:
+		cur_req->rollback = hold_rollback;
 		cur_req->out.hdr.len = sizeof(cur_req->out.hdr) +
 					sizeof(cur_req->out.arg.entry);
 		cur_req->out.hdr.error = fuse_lookup(&in.f);
@@ -1029,6 +1142,7 @@ enum service_result api_service_poll(void)
 		cur_req->out.hdr.error = fuse_readlink(&in.f);
 		break;
 	case FUSE_OPEN:
+		cur_req->rollback = open_cleanup;
 		cur_req->out.hdr.len = sizeof(cur_req->out.hdr) +
 					sizeof(cur_req->out.arg.open);
 		cur_req->out.hdr.error = fuse_open(&in.f);
@@ -1043,6 +1157,7 @@ enum service_result api_service_poll(void)
 		cur_req->out.hdr.len = sizeof(cur_req->out.hdr);
 		break;
 	case FUSE_OPENDIR:
+		cur_req->rollback = opendir_rollback;
 		cur_req->out.hdr.len =  sizeof(cur_req->out.hdr) +
 					sizeof(cur_req->out.arg.open);
 		cur_req->out.hdr.error = fuse_opendir(&in.f);
@@ -1056,24 +1171,39 @@ enum service_result api_service_poll(void)
 		cur_req->out.hdr.len = sizeof(cur_req->out.hdr);
 		fuse_releasedir(&in.f);
 		break;
+	case FUSE_INTERRUPT:
+		/* TODO */
+		return SERVICED_OK;	/* interrupt sends no reply */
 #if 0				/* Not implemented yet... */
+	case FUSE_MKNOD:
+	case FUSE_MKDIR:
+	case FUSE_SYMLINK:
+	case FUSE_LINK:
+		cur_req->rollback = hold_rollback;
+		/* ... */
+
+	case FUSE_CREATE:
+		cur_req->rollback = open_cleanup;
+		/* ... */
+
+
 	case FUSE_FLUSH:
 	case FUSE_FSYNC:
 	case FUSE_STATFS:
 	case FUSE_WRITE:
 	case FUSE_SETATTR:	/* chmod/chown/truncate */
 	case FUSE_FSYNCDIR:
-	case FUSE_MKNOD:
-	case FUSE_MKDIR:
 	case FUSE_UNLINK:
 	case FUSE_RMDIR:
-	case FUSE_SYMLINK:
 	case FUSE_RENAME:
-	case FUSE_LINK:
 	case FUSE_SETXATTR:
 	case FUSE_GETXATTR:
 	case FUSE_LISTXATTR:
 	case FUSE_REMOVEXATTR:
+	case FUSE_GETLK:
+	case FUSE_SETLK:
+	case FUSE_SETLKW:
+	case FUSE_ACCESS:
 #endif
 	default:
 		cur_req->out.hdr.error = -ENOSYS;
