@@ -251,7 +251,7 @@ int gitfs_server_read_config(void)
 
 	/* If there's a normal git config file, read it */
 	if (stat("config", &dummy_st) == 0 &&
-	    git_config(gitfs_config_file_worker) != 0)
+	    git_config(gitfs_config_file_worker, NULL) != 0)
 		return -1;
 	/*
 	 * Now take all of the entries previously put into the "from_cmd_line"

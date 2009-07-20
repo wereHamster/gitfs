@@ -44,7 +44,7 @@ static void gitwork_find_packname(struct gitwork_cmd *cmd)
 static int raw_resolve_reference(const unsigned char *obuf,
 				 unsigned char **nbufp, unsigned long *sizep,
 				 const char *ref_str, size_t reflen,
-				 char *type)
+				 enum object_type *type)
 {
 	struct gitobj_ptr nptr;
 
@@ -68,17 +68,17 @@ static int raw_resolve_reference(const unsigned char *obuf,
 static int git_read(const struct gitobj_ptr *ptr,
 		    struct gitwork_open_result *ores)
 {
-	char type[20];
+	enum object_type type;
 	unsigned char *buf;
 	int res;
 
-	buf = read_sha1_file(&ptr->sha1[0], type, &ores->size);
+	buf = read_sha1_file(&ptr->sha1[0], &type, &ores->size);
 	if (buf == NULL)
 		return -ENOENT;
 	ores->buf = buf;
-	if (0 == strcmp(type, "tag")) {
+	if (type == OBJ_TAG) {
 		res = resolve_reference(ores->buf, &buf,
-					&ores->size, "object", type);
+					&ores->size, "object", &type);
 		free(ores->buf);
 		if (res != 0) {
 			assert(res < 0);
@@ -86,9 +86,9 @@ static int git_read(const struct gitobj_ptr *ptr,
 		}
 		ores->buf = buf;
 	}
-	if (0 == strcmp(type, "commit")) {
+	if (type == OBJ_COMMIT) {
 		res = resolve_reference(ores->buf, &buf,
-					&ores->size, "tree", type);
+					&ores->size, "tree", &type);
 		free(ores->buf);
 		if (res != 0) {
 			assert(res < 0);
@@ -96,9 +96,9 @@ static int git_read(const struct gitobj_ptr *ptr,
 		}
 		ores->buf = buf;
 	}
-	if (0 == strcmp(type, "tree")) {
+	if (type == OBJ_TREE) {
 		ores->type = GFN_DIR;
-	} else if (0 == strcmp(type, "blob")) {
+	} else if (type == OBJ_BLOB) {
 		ores->type = GFN_FILE;
 		/* Note: this could actually turn out to be a symlink */
 	} else {
@@ -117,10 +117,8 @@ static void gitwork_object_info(struct gitwork_cmd *cmd)
 	 */
 	if (cmd->answer.open.type == GFN_FILE ||
 	    cmd->answer.open.type == GFN_SYMLINK) {
-		char type[20];
-		if (sha1_object_info(&cmd->gptr->sha1[0], type,
-				     &cmd->answer.open.size) == 0 &&
-		    0 == strcmp(type, "blob")) {
+		int type = sha1_object_info(&cmd->gptr->sha1[0], &cmd->answer.open.size);
+		if (type == OBJ_BLOB) {
 			cmd->error = 0;
 			cmd->answer.open.type = GFN_FILE;
 			cmd->answer.open.buf = NULL;

@@ -6,9 +6,9 @@ endif
 
 # Set to where your git source tree is, and what flags are required to build
 # against it
-GITDIR = ../git/git-1.4.4
+GITDIR = ../git
 GITCFLAGS = '-DSHA1_HEADER=<openssl/sha.h>' -I$(GITDIR)
-GITLDFLAGS = $(GITDIR)/libgit.a -lcrypto -lz
+GITLDFLAGS = $(GITDIR)/libgit.a $(GITDIR)/xdiff/lib.a -lcrypto -lz
 
 DEFINEFLAGS = -D_FILE_OFFSET_BITS=64 -D_REENTRANT $(GITCFLAGS) $(FUSECFLAGS)
 
