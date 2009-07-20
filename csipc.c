@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 
 static char *ipc_socket_name = NULL;
 static int ipc_socket_fd = -1;
