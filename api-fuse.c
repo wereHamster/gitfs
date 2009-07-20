@@ -27,7 +27,7 @@
  * We don't need any help from the fuse library but we still need to link
  * against <linux/fuse.h> for the ABI definitions
  */
-#include FUSE_HEADER
+#include <linux/fuse.h>
 
 #define GITFS_MAX_FUSE_WRITE	(4096)
 

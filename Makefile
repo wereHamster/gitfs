@@ -10,9 +10,6 @@ GITDIR = ../git/git-1.4.4
 GITCFLAGS = '-DSHA1_HEADER=<openssl/sha.h>' -I$(GITDIR)
 GITLDFLAGS = $(GITDIR)/libgit.a -lcrypto -lz
 
-# What flags are required to build against FUSE
-FUSECFLAGS = '-DFUSE_HEADER="../git/linux-2.6/include/linux/fuse.h"'
-
 DEFINEFLAGS = -D_FILE_OFFSET_BITS=64 -D_REENTRANT $(GITCFLAGS) $(FUSECFLAGS)
 
 OBJS = gitobj.o api-fuse.o gnode.o topdir.o util.o tagdir.o autotree.o \
