@@ -21,6 +21,9 @@ struct __gitfs_object {
 	unsigned char rev[20];
 	struct object *obj;
 	unsigned mode;
+
+	unsigned long size;
+	void *data;
 };
 
 static const char *parse(const char *path, unsigned char sha1[20])
@@ -175,6 +178,11 @@ static int __gitfs_open(const char *path, struct fuse_file_info *fi)
 	if ((fi->flags & 3) != O_RDONLY)
 		return -EACCES;
 
+	enum object_type type;
+	obj->data = read_sha1_file(obj->obj->sha1, &type, &obj->size);
+
+	assert(type == obj->obj->type);
+
 	fi->fh = (uint64_t) obj;
 
 	return 0;
@@ -182,28 +190,19 @@ static int __gitfs_open(const char *path, struct fuse_file_info *fi)
 
 static int __gitfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-	unsigned long len;
-
 	struct __gitfs_object *obj = (struct __gitfs_object *) fi->fh;
 	assert(obj);
 
 	if (obj->obj->type != OBJ_BLOB)
 		return -ENOENT;
 	
-	enum object_type type;
-	void *data = read_sha1_file(obj->obj->sha1, &type, &len);
-
-	assert(type == obj->obj->type);
-
-	if (offset < len) {
-		if (offset + size > len)
-			size = len - offset;
-		memcpy(buf, data + offset, size);
+	if (offset < obj->size) {
+		if (offset + size > obj->size)
+			size = obj->size - offset;
+		memcpy(buf, obj->data + offset, size);
 	} else {
 		size = 0;
 	}
-
-	free(data);
 
 	return size;
 }
@@ -213,6 +212,7 @@ static int __gitfs_release(const char *path, struct fuse_file_info *fi)
 	struct __gitfs_object *obj = (struct __gitfs_object *) fi->fh;
 	assert(obj);
 
+	free(obj->data);
 	free(obj);
 
 	return 0;
