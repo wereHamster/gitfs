@@ -317,6 +317,7 @@ static struct fuse_operations __gitfs_ops = {
 
 int main(int argc, char *argv[])
 {
+	const char *retval = setup_git_directory();
 	git_config(git_default_config, NULL);
 
 	return fuse_main(argc, argv, &__gitfs_ops, NULL);
