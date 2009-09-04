@@ -125,7 +125,10 @@ static int __gitfs_getattr(const char *path, struct stat *stbuf)
 		stbuf->st_mode = S_IFREG | obj->mode;
 		stbuf->st_nlink = 1;
 
-		sha1_object_info(obj->obj->sha1, &stbuf->st_size);
+		unsigned long size;
+		sha1_object_info(obj->obj->sha1, &size);
+
+		stbuf->st_size = size;
 	} else {
 		res = -ENOENT;
 	}
