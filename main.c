@@ -243,9 +243,9 @@ struct __gitfs_readdir_ctx {
 };
 
 static int show_tree(const unsigned char *sha1, const char *base, int baselen,
-             const char *pathname, unsigned mode, int stage, void *context)
+             const char *pathname, unsigned int mode, int stage, void *context)
 {
-        struct __gitfs_readdir_ctx *ctx = context;
+    struct __gitfs_readdir_ctx *ctx = context;
 
     (*ctx->filler) (ctx->buf, pathname, NULL, 0);
 
@@ -256,9 +256,9 @@ static int show_ref(const char *refname, const unsigned char *sha1, int flag, vo
 {
     struct __gitfs_readdir_ctx *ctx = context;
 
-        (*ctx->filler) (ctx->buf, refname, NULL, 0);
+    (*ctx->filler) (ctx->buf, refname, NULL, 0);
 
-        return 0;
+    return 0;
 }
 
 static int __gitfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
@@ -280,12 +280,15 @@ static int __gitfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, 
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
 
-        struct tree *tree = (struct tree *) obj->obj;
+    struct tree *tree = (struct tree *) obj->obj;
 
-        read_tree_recursive(tree, "", 0, 0, NULL, show_tree, &ctx);
+    struct pathspec pathspec;
+    init_pathspec(&pathspec, NULL);
+
+    read_tree_recursive(tree, "", 0, 0, &pathspec, show_tree, &ctx);
 
     free(obj);
-    
+
     return 0;
 }
 
